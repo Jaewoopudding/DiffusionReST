@@ -25,6 +25,8 @@ import tqdm
 import tempfile
 from PIL import Image
 
+from sd_pipeline import Decoding_MCTS
+
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 
@@ -38,11 +40,16 @@ def main(_):
     # basic Accelerate and logging setup
     config = FLAGS.config
 
-    unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
-    if not config.run_name:
-        config.run_name = unique_id
-    else:
-        config.run_name += "_" + unique_id
+    # number of timesteps within each trajectory to train on
+    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
+
+    accelerator_config = ProjectConfiguration(
+        project_dir=os.path.join(config.logdir, config.run_name),
+        automatic_checkpoint_naming=True,
+        total_limit=config.num_checkpoint_limit,
+    )
+    
+    config.run_name = f'{config.reward_fn}_{config.sample.batch_size * config.sample.num_batches_per_epoch * torch.cuda.device_count()}_{config.run_name}'
 
     if config.resume_from:
         config.resume_from = os.path.normpath(os.path.expanduser(config.resume_from))
@@ -57,15 +64,6 @@ def main(_):
                 config.resume_from,
                 sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
             )
-
-    # number of timesteps within each trajectory to train on
-    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
-
-    accelerator_config = ProjectConfiguration(
-        project_dir=os.path.join(config.logdir, config.run_name),
-        automatic_checkpoint_naming=True,
-        total_limit=config.num_checkpoint_limit,
-    )
 
     accelerator = Accelerator(
         log_with="wandb",
@@ -84,6 +82,8 @@ def main(_):
             init_kwargs={"wandb": {"name": config.run_name}},
         )
     logger.info(f"\n{config}")
+
+
 
     # set seed (device_specific is very important to get different prompts on different devices)
     set_seed(config.seed, device_specific=True)
@@ -110,7 +110,7 @@ def main(_):
     pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
+    # as these weights are only used for inference, keeping weights in full precision is not re ired.
     inference_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         inference_dtype = torch.float16
@@ -333,6 +333,7 @@ def main(_):
 
             # sample
             with autocast():
+                
                 images, _, latents, log_probs = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,

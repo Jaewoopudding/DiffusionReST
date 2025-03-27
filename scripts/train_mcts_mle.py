@@ -370,6 +370,16 @@ def main(_):
                     prompts=prompts,
                     prompt_metadata=prompt_metadata,
                 )
+                
+                eval_images, _, _, _ = pipeline_with_logprob(
+                    pipeline,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=sample_neg_prompt_embeds,
+                    num_inference_steps=config.sample.num_steps,
+                    guidance_scale=config.sample.guidance_scale,
+                    eta=config.sample.eta,
+                    output_type="pt",
+                )
 
             latents = torch.stack(
                 latents, dim=1
@@ -381,6 +391,7 @@ def main(_):
 
             # compute rewards asynchronously
             rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
+            eval_rewards = executor.submit(reward_fn, eval_images, prompts, prompt_metadata)
             # evals = executor.submit(eval_fn, images, prompts)
             # yield to to make sure reward computation starts
             time.sleep(0)
@@ -399,6 +410,7 @@ def main(_):
                     ],  # each entry is the latent after timestep t
                     "log_probs": log_probs,
                     "rewards": rewards,
+                    "eval_rewards": eval_rewards
                     # "evals": evals
                 }
             )
@@ -411,8 +423,10 @@ def main(_):
             position=0,
         ):
             rewards, reward_metadata = sample["rewards"].result()
+            eval_rewards, _ = sample["eval_rewards"].result()
             # accelerator.print(reward_metadata)
             sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
+            sample["eval_rewards"] = torch.as_tensor(eval_rewards, device=accelerator.device)
             # eval_results = sample["evals"].result()
             eval_results = {key: torch.as_tensor(value, device=accelerator.device) for key, value in sample.items() if key not in ["prompt_ids", "prompt_embeds", "timesteps", "latents", "next_latents", "log_probs", "rewards"]}
             sample.update(eval_results)
@@ -429,6 +443,14 @@ def main(_):
                 )
                 pil = pil.resize((256, 256))
                 pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+                
+            for i, image in enumerate(eval_images):
+                pil = Image.fromarray(
+                    (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                )
+                pil = pil.resize((256, 256))
+                pil.save(os.path.join(tmpdir, f"{i}_eval.jpg"))
+                
             accelerator.log(
                 {
                     "images": [
@@ -440,19 +462,32 @@ def main(_):
                             zip(prompts, rewards)
                         )  # only log rewards from process 0
                     ],
+                    "eval_images": [
+                        wandb.Image(
+                            os.path.join(tmpdir, f"{i}_eval.jpg"),
+                            caption=f"{prompt:.25} | {eval_reward:.2f}",
+                        )
+                        for i, (prompt, eval_reward) in enumerate(
+                            zip(prompts, eval_rewards)
+                        )  # only log rewards from process 0
+                    ],
                 },
                 step=global_step,
             )
 
         # gather rewards across processes
         rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
+        eval_rewards = accelerator.gather(samples["eval_rewards"]).cpu().numpy()
         # metrics = {key: accelerator.gather(torch.stack([s[key] for s in samples])).cpu().numpy() for key in eval_results.keys()}
-        
+        breakpoint()
         # log rewards and images
         log_dict = {
             "reward": rewards,
             "reward_mean": rewards.mean(),
             "reward_std": rewards.std(),
+            "eval_reward": eval_rewards,
+            "eval_reward_mean": eval_rewards.mean(),
+            "eval_reward_std": eval_rewards.std(),
         }
 
         # for key, value in metrics.items():

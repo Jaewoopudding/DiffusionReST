@@ -34,7 +34,7 @@ def aesthetic_score():
 
     scorer = AestheticScorer(dtype=torch.float32).cuda()
 
-    def _fn(images, prompts, metadata):
+    def _fn(images, prompts, metadata=None):
         if isinstance(images, torch.Tensor):
             images = (images * 255).round().clamp(0, 255).to(torch.uint8)
         else:
@@ -43,6 +43,139 @@ def aesthetic_score():
         scores = scorer(images)
         return scores, {}
 
+    return _fn
+
+
+def clip_score(
+    return_loss=False, 
+):
+    from ddpo_pytorch.clip_scorer import CLIPScorer
+
+    scorer = CLIPScorer(dtype=torch.float32, device='cuda')
+    scorer.requires_grad_(False)
+
+    if not return_loss:
+        def _fn(images, prompts):
+            if images.min() < 0: # normalize unnormalized images
+                images = ((images / 2) + 0.5).clamp(0, 1)
+            scores = scorer(images, prompts)
+            return scores
+
+        return _fn
+
+    else:
+        def loss_fn(images, prompts):
+            if images.min() < 0: # normalize unnormalized images
+                images = ((images / 2) + 0.5).clamp(0, 1)
+            scores = scorer(images, prompts)
+
+            loss = - scores
+            return loss, scores
+
+        return loss_fn
+
+
+# def hps_score(
+#     return_loss=False, 
+# ):
+#     from ddpo_pytorch.hpsv2_scorer import HPSv2Scorer
+
+#     scorer = HPSv2Scorer(dtype=torch.float32, device='cuda').cuda()
+#     scorer.requires_grad_(False)
+
+#     if not return_loss:
+#         def _fn(images, prompts):
+#             if images.min() < 0: # normalize unnormalized images
+#                 images = ((images / 2) + 0.5).clamp(0, 1)
+#             scores = scorer(images, prompts)
+#             return scores
+
+#         return _fn
+
+#     else:
+#         def loss_fn(images, prompts):
+#             if images.min() < 0: # normalize unnormalized images
+#                 images = ((images / 2) + 0.5).clamp(0, 1)
+#             scores = scorer(images, prompts)
+
+#             loss = 1.0 - scores
+#             return loss, scores
+
+#         return loss_fn
+
+
+# def ImageReward(
+#     return_loss=False, 
+# ):
+#     from ddpo_pytorch.ImageReward_scorer import ImageRewardScorer
+
+#     scorer = ImageRewardScorer(dtype=torch.float32, device='cuda').cuda()
+#     scorer.requires_grad_(False)
+
+#     if not return_loss:
+#         def _fn(images, prompts):
+#             if images.min() < 0: # normalize unnormalized images
+#                 images = ((images / 2) + 0.5).clamp(0, 1)
+#             scores = scorer(images, prompts)
+#             return scores
+
+#         return _fn
+
+#     else:
+#         def loss_fn(images, prompts):
+#             if images.min() < 0: # normalize unnormalized images
+#                 images = ((images / 2) + 0.5).clamp(0, 1)
+#             scores = scorer(images, prompts)
+
+#             loss = - scores
+#             return loss, scores
+
+#         return loss_fn
+    
+
+
+# def PickScore(
+#     return_loss=False, 
+# ):
+#     from ddpo_pytorch.PickScore_scorer import PickScoreScorer
+
+#     scorer = PickScoreScorer(dtype=torch.float32, device='cuda').cuda()
+#     scorer.requires_grad_(False)
+
+#     if not return_loss:
+#         def _fn(images, prompts):
+#             if images.min() < 0: # normalize unnormalized images
+#                 images = ((images / 2) + 0.5).clamp(0, 1)
+#             scores = scorer(images, prompts)
+#             return scores
+
+#         return _fn
+
+#     else:
+#         def loss_fn(images, prompts):
+#             if images.min() < 0: # normalize unnormalized images
+#                 images = ((images / 2) + 0.5).clamp(0, 1)
+#             scores = scorer(images, prompts)
+
+#             loss = - scores
+#             return loss, scores
+
+#         return loss_fn
+
+def multi_reward_evaluation():
+    def _fn(images, prompts):
+        aesthetic_score_fn = aesthetic_score()
+        # hps_score_fn = hps_score()
+        # pick_score_fn = PickScore()
+        # image_reward_fn = ImageReward()
+        # clip_score_fn = clip_score()
+        return {
+            # "aesthetic_score": aesthetic_score_fn(images, prompts),
+            # "hps_score": hps_score_fn(images, prompts),
+            # "PickScore": pick_score_fn(images, prompts),
+            # "ImageReward": image_reward_fn(images, prompts),
+            # "clip_score": clip_score_fn(images, prompts)
+        }
     return _fn
 
 

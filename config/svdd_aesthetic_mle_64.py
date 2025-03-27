@@ -52,7 +52,7 @@ def get_config():
     sample.batch_size = 1
     # number of batches to sample per epoch. the total number of samples per epoch is `num_batches_per_epoch *
     # batch_size * num_gpus`.
-    sample.num_batches_per_epoch = 16
+    sample.num_batches_per_epoch = 32
 
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
@@ -88,9 +88,9 @@ def get_config():
     
     
     # number of gradient steps to take per improve step
-    train.gradient_steps_per_improve_step = 100
+    train.gradient_steps_per_improve_step = 1000
     # number of total batch size used at improve step
-    train.total_batch_size = 32
+    train.total_batch_size = 256
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
@@ -118,7 +118,7 @@ def get_config():
     config.search = search = ml_collections.ConfigDict()
     
     search.nfe_per_action = 1
-    search.duplicate = 1
+    search.duplicate = 10
     search.expansion_coef = 0.0
     search.progressive_widening = False
     search.pw_alpha = 0.0

@@ -6,6 +6,7 @@
 
 from typing import Any, Callable, Dict, List, Optional, Union
 from tqdm import tqdm
+tqdm.tqdm = lambda *args, **kwargs: args[0]
 import torch
 
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
@@ -449,8 +450,8 @@ def tree_pipeline_with_logprob(
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
     
     with self.progress_bar(total=num_inference_steps) as progress_bar:
-        for i, t in enumerate(tqdm(timesteps, position=2, desc="Timesteps", leave=False)):
-            for _ in tqdm(range(config.search.nfe_per_action), position=3, desc="NFE Budget", leave=False):
+        for i, t in enumerate(tqdm(timesteps, position=2, desc="Timesteps", leave=False, disable=True)):
+            for _ in tqdm(range(config.search.nfe_per_action), position=3, desc="NFE Budget", leave=False, disable=True):
                 current_nodes = tree.select(select_fn=tree.UCT)
                 tree.expand(nodes=current_nodes, use_gradient=config.search.value_gradient, jump=config.search.jump_policy)    
             tree.act_and_prune(select_fn=tree.max_value, prune=True)  

@@ -2,7 +2,7 @@ import torch, torchvision
 import numpy as np
 from tqdm import tqdm
 from ddpo_pytorch.diffusers_patch.ddim_with_kl import predict_x0_from_xt_MCTS, ddim_step_KL_MCTS
-
+tqdm.tqdm = lambda *args, **kwargs: args[0]
 
 class Node:
     def __init__(self, state, reward, timestep, log_prob=None, parent=None):
@@ -186,7 +186,7 @@ class TreePolicy:
             torch.ones(1, config.search.duplicate * config.search.nfe_per_action, device=self.device) * pipeline.scheduler.timesteps[0]
         )
         
-        for nodes in tqdm(list(zip(*self.root_nodes.get_novel_children())), desc='Initial Evaluating', leave=False, position=2):
+        for nodes in tqdm(list(zip(*self.root_nodes.get_novel_children())), desc='Initial Evaluating', leave=False, position=2, disable=True):
             self.evaluate(BatchedNode(nodes))
             self.backpropagate(nodes)
 
@@ -312,7 +312,7 @@ class TreePolicy:
             ).repeat_interleave(duplicate).view(1, duplicate)
             nodes.add_children(new_latents, new_timesteps, log_probs.view(1, duplicate))
 
-            for idx, nodes in enumerate(tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=2)):
+            for idx, nodes in enumerate(tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=2, disable=True)):
                 self.evaluate(BatchedNode(nodes), jump_latents[idx], jump_timesteps)
                 self.backpropagate(nodes)
     

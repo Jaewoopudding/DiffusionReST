@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 import wandb
 from diffusers import DDIMScheduler
-
+tqdm.tqdm = lambda *args, **kwargs: args[0]
 import os
 import sys
 sys.path.append(os.getcwd())
@@ -182,8 +182,8 @@ class Decoding_MCTS(StableDiffusionPipeline):
         
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
             
-        for i in tqdm(timesteps, position=1, desc="Timesteps", leave=False):
-            for _ in tqdm(range(self.nfe_per_action), position=2, desc="NFE Budget", leave=False):
+        for i in tqdm(timesteps, position=1, desc="Timesteps", leave=False, disable=True):
+            for _ in tqdm(range(self.nfe_per_action), position=2, desc="NFE Budget", leave=False, disable=True):
                 current_nodes = tree.select(select_fn=tree.UCT)
                 tree.expand(nodes=current_nodes, use_gradient=self.value_gradient, jump=self.jump_policy)    
             tree.act_and_prune(select_fn=tree.max_value, prune=True)  

@@ -51,3 +51,50 @@ class AestheticScorer(torch.nn.Module):
         # normalize embedding
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         return self.mlp(embed).squeeze(1)
+
+
+class MLPDiff(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(768, 1024),
+            nn.Dropout(0.2),
+            nn.Linear(1024, 128),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.Dropout(0.1),
+            nn.Linear(64, 16),
+            nn.Linear(16, 1),
+        )
+
+
+    def forward(self, embed):
+        return self.layers(embed)
+    
+    def forward_up_to_second_last(self, embed):
+        # Process the input through all layers except the last one
+        for layer in list(self.layers)[:-1]:
+            embed = layer(embed)
+        return embed
+
+class AestheticScorerDiff(torch.nn.Module):
+    def __init__(self, dtype):
+        super().__init__()
+        self.clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+        self.mlp = MLPDiff()
+        state_dict = torch.load(ASSETS_PATH.joinpath("sac+logos+ava1-l14-linearMSE.pth"), weights_only=True)
+        self.mlp.load_state_dict(state_dict)
+        self.dtype = dtype
+        self.eval()
+
+    def __call__(self, images):
+        device = next(self.parameters()).device
+        embed = self.clip.get_image_features(pixel_values=images)
+        embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
+        return self.mlp(embed).squeeze(1), embed
+    
+    def generate_feats(self, images):
+        device = next(self.parameters()).device
+        embed = self.clip.get_image_features(pixel_values=images)
+        embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
+        return embed

@@ -355,7 +355,6 @@ def main(_):
                 shape = (config.search.duplicate * config.search.nfe_per_action, 4, 64, 64)
                 init_latents = torch.randn(shape, device=accelerator.device)
                 pipeline.batch_size = 1
-                
                 images, _, latents, log_probs = tree_pipeline_with_logprob(
                     pipeline,
                     config=config,
@@ -436,6 +435,26 @@ def main(_):
         samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
 
         # this is a hack to force wandb to log the images as JPEGs instead of PNGs
+
+
+        save_dir = config.run_name
+        os.makedirs(save_dir, exist_ok=True)
+
+        for i, image in enumerate(images):
+            pil = Image.fromarray(
+                (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+            )
+            pil = pil.resize((256, 256))
+            pil.save(os.path.join(save_dir, f"{i}.jpg"))
+
+        for i, image in enumerate(eval_images):
+            pil = Image.fromarray(
+                (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+            )
+            pil = pil.resize((256, 256))
+            pil.save(os.path.join(save_dir, f"{i}_eval.jpg"))
+
+
         with tempfile.TemporaryDirectory() as tmpdir:
             for i, image in enumerate(images):
                 pil = Image.fromarray(
@@ -479,7 +498,7 @@ def main(_):
         rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
         eval_rewards = accelerator.gather(samples["eval_rewards"]).cpu().numpy()
         # metrics = {key: accelerator.gather(torch.stack([s[key] for s in samples])).cpu().numpy() for key in eval_results.keys()}
-        breakpoint()
+
         # log rewards and images
         log_dict = {
             "reward": rewards,

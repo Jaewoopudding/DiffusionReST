@@ -1,6 +1,6 @@
 import heapq
 import random
-
+import statistics
 class PrioritizedReplayBuffer:
     def __init__(self, capacity: int, priority: str):
         """
@@ -63,6 +63,21 @@ class PrioritizedReplayBuffer:
         samples = random.sample(filtered_experiences, batch_size)
         return samples
 
+
+    def reward_median(self, reward_key='rewards'):
+        """
+        버퍼 내 저장된 경험들의 보상(reward)의 중간값(median)을 반환합니다.
+        :param reward_key: 경험에서 reward 값을 나타내는 키 이름 (기본값: 'reward')
+        :return: rewards 값의 중간값(median)
+        """
+        if len(self.buffer) == 0:
+            raise ValueError("버퍼가 비어 있습니다.")
+
+        rewards = [exp[reward_key] for _, exp in self.buffer if reward_key in exp]
+        if not rewards:
+            raise ValueError(f"경험에 '{reward_key}' 키가 없습니다.")
+
+        return statistics.median(rewards)
 
     def cutoff(self, threshold: float):
         """

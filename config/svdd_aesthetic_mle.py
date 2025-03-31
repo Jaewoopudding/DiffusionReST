@@ -15,7 +15,7 @@ def get_config():
     # samples.
     config.num_epochs = 10
     # number of epochs between saving model checkpoints.
-    config.save_freq = 20
+    config.save_freq = 1
     # number of checkpoints to keep before overwriting old ones.
     config.num_checkpoint_limit = 5
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
@@ -94,7 +94,7 @@ def get_config():
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
-    config.prompt_fn = "imagenet_animals"
+    config.prompt_fn = "imagenet_rottweiler"
     # kwargs to pass to the prompt function.
     config.prompt_fn_kwargs = {}
 

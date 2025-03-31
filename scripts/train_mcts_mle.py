@@ -325,6 +325,7 @@ def main(_):
         #################### SAMPLING ####################
         pipeline.unet.eval()
         samples = []
+        eval_samples = []
         prompts = []
         for i in tqdm(
             range(config.sample.num_batches_per_epoch),
@@ -370,7 +371,7 @@ def main(_):
                     prompt_metadata=prompt_metadata,
                 )
                 
-                eval_images, _, _, _ = pipeline_with_logprob(
+                eval_images, _, eval_latents, eval_log_probs = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=sample_neg_prompt_embeds,
@@ -387,6 +388,9 @@ def main(_):
             timesteps = pipeline.scheduler.timesteps.repeat(
                 config.sample.batch_size, 1
             )  # (batch_size, num_steps)
+            
+            eval_latents = torch.stack(eval_latents, dim=1)
+            eval_log_probs = torch.stack(eval_log_probs)
 
             # compute rewards asynchronously
             rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
@@ -413,6 +417,24 @@ def main(_):
                     # "evals": evals
                 }
             )
+            
+            eval_samples.append(
+                {
+                    "prompt_ids": prompt_ids,
+                    "prompt_embeds": prompt_embeds,
+                    "timesteps": timesteps,
+                    "latents": eval_latents[
+                        :, :-1
+                    ],  # each entry is the latent before timestep t
+                    "next_latents": eval_latents[
+                        :, 1:
+                    ],  # each entry is the latent after timestep t
+                    "log_probs": eval_log_probs,
+                    "rewards": rewards,
+                    "eval_rewards": eval_rewards
+                    # "evals": evals
+                }
+            )
 
         # wait for all rewards to be computed
         for sample in tqdm(
@@ -426,6 +448,24 @@ def main(_):
             # accelerator.print(reward_metadata)
             sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
             sample["eval_rewards"] = torch.as_tensor(eval_rewards, device=accelerator.device)
+            
+            # eval_results = sample["evals"].result()
+            eval_results = {key: torch.as_tensor(value, device=accelerator.device) for key, value in sample.items() if key not in ["prompt_ids", "prompt_embeds", "timesteps", "latents", "next_latents", "log_probs", "rewards"]}
+            sample.update(eval_results)
+            # del sample["evals"]
+            
+        for sample in tqdm(
+            eval_samples,
+            desc="Waiting for rewards",
+            disable=not accelerator.is_local_main_process,
+            position=0,
+        ):
+            rewards, reward_metadata = sample["rewards"].result()
+            eval_rewards, _ = sample["eval_rewards"].result()
+            # accelerator.print(reward_metadata)
+            sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
+            sample["eval_rewards"] = torch.as_tensor(eval_rewards, device=accelerator.device)
+            
             # eval_results = sample["evals"].result()
             eval_results = {key: torch.as_tensor(value, device=accelerator.device) for key, value in sample.items() if key not in ["prompt_ids", "prompt_embeds", "timesteps", "latents", "next_latents", "log_probs", "rewards"]}
             sample.update(eval_results)
@@ -433,6 +473,7 @@ def main(_):
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
+        eval_samples = {k: torch.cat([s[k] for s in eval_samples]) for k in eval_samples[0].keys()}
 
         # this is a hack to force wandb to log the images as JPEGs instead of PNGs
 
@@ -604,12 +645,12 @@ def main(_):
                 disable=not accelerator.is_local_main_process,
             ):
 
-                samples_from_buffer = buffer.sample(int(config.train.total_batch_size / (accelerator.num_processes)))
+                samples_from_buffer = buffer.sample(int(config.train.total_batch_size / (accelerator.num_processes)), target_threshold={"rewards": eval_rewards.mean()})
             
                 for j, sample in enumerate(tqdm(
                     samples_from_buffer,
                     position=1,
-                    leave=True,
+                    leave=False,
                     desc=f'Grow: {epoch + 1} | Improve {improve_steps + 1} | Batch Iteration',
                     disable=not accelerator.is_local_main_process,)
                 ):

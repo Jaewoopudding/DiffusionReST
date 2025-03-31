@@ -43,16 +43,26 @@ class PrioritizedReplayBuffer:
             if prio_value > self.buffer[0][0]:
                 heapq.heapreplace(self.buffer, (prio_value, exp))
 
-    def sample(self, batch_size: int):
+    def sample(self, batch_size: int, target_threshold: dict):
         """
         버퍼에서 무작위로 미니배치 샘플을 반환합니다.
+        추가적으로 target_threshold 조건을 만족하는 경험만 샘플합니다.
+
         :param batch_size: 샘플링할 경험의 개수
+        :param target_threshold: {key: threshold} 조건을 만족해야 하는 추가 조건
         :return: 샘플된 경험 리스트 (각 경험은 dict)
         """
-        if batch_size > len(self.buffer):
-            raise ValueError("배치 사이즈가 버퍼에 저장된 경험 수보다 많습니다.")
-        samples = random.sample(self.buffer, batch_size)
-        return [exp for _, exp in samples]
+        # 조건을 만족하는 경험만 필터링합니다.
+        filtered_experiences = [exp for _, exp in self.buffer
+                                if all(exp.get(key, float('-inf')) >= threshold
+                                    for key, threshold in target_threshold.items())]
+
+        if batch_size > len(filtered_experiences):
+            raise ValueError("배치 사이즈가 조건을 만족하는 경험 수보다 많습니다.")
+
+        samples = random.sample(filtered_experiences, batch_size)
+        return samples
+
 
     def cutoff(self, threshold: float):
         """

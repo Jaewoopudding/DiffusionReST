@@ -13,9 +13,9 @@ def get_config():
     config.logdir = "logs"
     # number of epochs to train for. each epoch is one round of sampling from the model followed by training on those
     # samples.
-    config.num_epochs = 100
+    config.num_epochs = 10
     # number of epochs between saving model checkpoints.
-    config.save_freq = 20
+    config.save_freq = 1
     # number of checkpoints to keep before overwriting old ones.
     config.num_checkpoint_limit = 5
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
@@ -52,7 +52,7 @@ def get_config():
     sample.batch_size = 1
     # number of batches to sample per epoch. the total number of samples per epoch is `num_batches_per_epoch *
     # batch_size * num_gpus`.
-    sample.num_batches_per_epoch = 1
+    sample.num_batches_per_epoch = 8
 
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
@@ -61,7 +61,7 @@ def get_config():
     # whether to use the 8bit Adam optimizer from bitsandbytes.
     train.use_8bit_adam = False
     # learning rate.
-    train.learning_rate = 3e-4
+    train.learning_rate = 1e-5
     # Adam beta1.
     train.adam_beta1 = 0.9
     # Adam beta2.
@@ -70,14 +70,11 @@ def get_config():
     train.adam_weight_decay = 1e-4
     # Adam epsilon.
     train.adam_epsilon = 1e-8
-    # number of gradient accumulation steps. the effective batch size is `batch_size * num_gpus *
-    # gradient_accumulation_steps`.
-    train.gradient_accumulation_steps = 1
     # maximum gradient norm for gradient clipping.
     train.max_grad_norm = 1.0
     # number of inner epochs per outer epoch. each inner epoch is one iteration through the data collected during one
     # outer epoch's round of sampling.
-    train.num_inner_epochs = 1
+    train.improve_steps = 1
     # whether or not to use classifier-free guidance during training. if enabled, the same guidance scale used during
     # sampling will be used during training.
     train.cfg = True
@@ -88,6 +85,12 @@ def get_config():
     # the fraction of timesteps to train on. if set to less than 1.0, the model will be trained on a subset of the
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
     train.timestep_fraction = 1.0
+    
+    
+    # number of gradient steps to take per improve step
+    train.gradient_steps_per_improve_step = 1000
+    # number of total batch size used at improve step
+    train.total_batch_size = 1
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
@@ -98,6 +101,7 @@ def get_config():
     ###### Reward Function ######
     # reward function to use. see `rewards.py` for available reward functions.
     config.reward_fn = "aesthetic_score" # aesthetic_score jpeg_compressibility
+    config.eval_fn = "multi_reward_evaluation"
 
     ###### Per-Prompt Stat Tracking ######
     # when enabled, the model will track the mean and std of reward on a per-prompt basis and use that to compute
@@ -122,6 +126,5 @@ def get_config():
     search.kl_lagrangian_coef = 0.0005
     search.tempering_gamma = 0.008
     search.jump_policy = False
-    
 
     return config

@@ -319,10 +319,11 @@ def main(_):
     else:
         first_epoch = 0
 
-    buffer = PrioritizedReplayBuffer(capacity=100000, priority="rewards")
+    
     global_step = 0
     for epoch in range(first_epoch, config.num_epochs):
         #################### SAMPLING ####################
+        buffer = PrioritizedReplayBuffer(capacity=100000, priority="rewards")
         pipeline.unet.eval()
         samples = []
         eval_samples = []

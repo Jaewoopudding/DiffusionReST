@@ -2,7 +2,7 @@ from PIL import Image
 import io
 import numpy as np
 import torch
-
+import torchvision
 
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):
@@ -29,10 +29,10 @@ def jpeg_compressibility():
     return _fn
 
 
-def aesthetic_score():
+def aesthetic_score(dtype = torch.float32):
     from ddpo_pytorch.aesthetic_scorer import AestheticScorer
 
-    scorer = AestheticScorer(dtype=torch.float32).cuda()
+    scorer = AestheticScorer(dtype).cuda()
 
     def _fn(images, prompts, metadata=None):
         if isinstance(images, torch.Tensor):
@@ -73,6 +73,34 @@ def clip_score(
             return loss, scores
 
         return loss_fn
+
+
+def aesthetic_score_diff(aesthetic_target=None,
+                     grad_scale=0,
+                     accelerator=None,
+                     torch_dtype=None):
+    from ddpo_pytorch.aesthetic_scorer import AestheticScorerDiff
+    
+    target_size = 224
+    normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                                std=[0.26862954, 0.26130258, 0.27577711])
+    scorer = AestheticScorerDiff(dtype=torch_dtype).to(dtype=torch_dtype)
+    scorer.requires_grad_(False)
+    target_size = 224
+    def loss_fn(im_pix_un, prompts=None, metadata=None):
+        im_pix = ((im_pix_un / 2) + 0.5).clamp(0, 1) 
+        im_pix = torchvision.transforms.Resize(target_size)(im_pix)
+        im_pix = normalize(im_pix).to(im_pix_un.dtype)
+        scorer_ = scorer.to(im_pix.device)
+        rewards = scorer_(im_pix)
+        if aesthetic_target is None: # default maximization
+            loss = -1 * rewards
+        else:
+            # using L1 to keep on same scale
+            loss = abs(rewards - aesthetic_target)
+        return loss * grad_scale, rewards
+    return loss_fn
+
 
 
 # def hps_score(

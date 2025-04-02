@@ -337,7 +337,11 @@ def main(_):
 
     # prepare prompt and reward fn
     prompt_fn = getattr(ddpo_pytorch.prompts, config.prompt_fn)
-    reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)()
+    
+    if "aesthetic" in config.reward_fn :
+        reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)(torch_dtype=inference_dtype)
+    else:
+        reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)()
     # eval_fn = getattr(ddpo_pytorch.rewards, config.eval_fn)()
 
     # generate negative prompt embeddings

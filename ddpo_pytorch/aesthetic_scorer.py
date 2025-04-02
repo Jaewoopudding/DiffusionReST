@@ -77,24 +77,26 @@ class MLPDiff(nn.Module):
             embed = layer(embed)
         return embed
 
+
 class AestheticScorerDiff(torch.nn.Module):
     def __init__(self, dtype):
         super().__init__()
         self.clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
         self.mlp = MLPDiff()
-        state_dict = torch.load(ASSETS_PATH.joinpath("sac+logos+ava1-l14-linearMSE.pth"), weights_only=True)
+        state_dict = torch.load(ASSETS_PATH.joinpath("sac+logos+ava1-l14-linearMSE.pth"))
         self.mlp.load_state_dict(state_dict)
         self.dtype = dtype
         self.eval()
 
     def __call__(self, images):
         device = next(self.parameters()).device
-        embed = self.clip.get_image_features(pixel_values=images)
+        embed = self.clip.get_image_features(pixel_values=images.to(self.dtype).to(device))
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
-        return self.mlp(embed).squeeze(1), embed
+        return self.mlp(embed).squeeze(1)
+
     
     def generate_feats(self, images):
         device = next(self.parameters()).device
-        embed = self.clip.get_image_features(pixel_values=images)
+        embed = self.clip.get_image_features(pixel_values=images.to(self.dtype).to(device))
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         return embed

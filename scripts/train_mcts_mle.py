@@ -56,6 +56,7 @@ def generate_evaluation_samples(
     """
     eval_images_list = []
     eval_samples = []
+    eval_rewards_list = []
     
     # 평가용 이미지 및 log_prob 샘플링
     for i in tqdm(
@@ -106,6 +107,7 @@ def generate_evaluation_samples(
     ):
         eval_rewards, _ = sample["eval_rewards"].result()
         sample["eval_rewards"] = torch.as_tensor(eval_rewards, device=accelerator.device)
+        eval_rewards_list.append(sample["eval_rewards"])
         # 추가 eval 결과를 텐서로 변환 (여기서는 key가 지정된 항목들을 제외한 나머지)
         eval_results = {
             key: torch.as_tensor(value, device=accelerator.device)
@@ -122,7 +124,7 @@ def generate_evaluation_samples(
         for k in eval_samples[0].keys()
     }
 
-    return eval_samples_collated, eval_images_list, eval_rewards
+    return eval_samples_collated, eval_images_list, torch.cat(eval_rewards_list)
 
 
 def main(_):
@@ -174,10 +176,6 @@ def main(_):
         # the total number of optimizer steps to accumulate across.
         gradient_accumulation_steps=int(config.train.total_batch_size / (torch.cuda.device_count()))
     )
-    
-    
-    
-    
     
     if accelerator.is_main_process:
         accelerator.init_trackers(
@@ -269,7 +267,8 @@ def main(_):
     else:
         unet = pipeline.unet
 
-
+    
+    
     # set up diffusers-friendly checkpoint saving with Accelerate
 
     def save_model_hook(models, weights, output_dir):
@@ -365,9 +364,12 @@ def main(_):
     # more memory
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
     # autocast = accelerator.autocast
+    
+    import copy
+    unet_pretrained = copy.deepcopy(unet)
 
     # Prepare everything with our `accelerator`.
-    unet, optimizer = accelerator.prepare(unet, optimizer)
+    unet, optimizer, unet_pretrained = accelerator.prepare(unet, optimizer, unet_pretrained)
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
@@ -390,10 +392,8 @@ def main(_):
     logger.info(
         f"  Total train batch size (w. parallel, distributed & accumulation) = {config.train.total_batch_size}"
     )
-    logger.info(
-        f"  Number of gradient updates per grow step = {config.train.gradient_steps_per_improve_step}"
-    )
     logger.info(f"  Number of improve steps per grow step = {config.train.improve_steps}")
+    logger.info(f"  Kullback-Liebler divergence coefficient = {config.train.kl_coef}")
 
     assert config.sample.batch_size >= config.train.batch_size
     assert config.sample.batch_size % config.train.batch_size == 0
@@ -730,34 +730,42 @@ def main(_):
                                 timesteps = torch.randint(0, pipeline.scheduler.config.num_train_timesteps, (config.train.batch_size,), device=accelerator.device)
                                 noise = torch.randn_like(clean_latents)
                                 noised_latents = pipeline.scheduler.add_noise(clean_latents, noise, timesteps)
-                                
-                                if np.random.random() < 0.1:
-                                    embeds = train_neg_prompt_embeds
-                                else:
-                                    embeds = sample["prompt_embeds"]
-                                    
+
                                 noise_pred = unet(
-                                    noised_latents,
-                                    timesteps,
+                                    torch.cat([noised_latents] * 2),
+                                    torch.cat([timesteps] * 2),
                                     embeds,
                                 ).sample
+                                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                                noise_pred = (
+                                    noise_pred_uncond
+                                    + config.sample.guidance_scale
+                                    * (noise_pred_text - noise_pred_uncond)
+                                )
                                 
-                                # DDPO style unet 으로 예측하기
-                                # noise_pred = unet(
-                                #     torch.cat([noised_latents] * 2),
-                                #     torch.cat([timesteps] * 2),
-                                #     embeds,
-                                # ).sample
-                                # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                                # noise_pred = (
-                                #     noise_pred_uncond
-                                #     + config.sample.guidance_scale
-                                #     * (noise_pred_text - noise_pred_uncond)
-                                # )
+                                if config.train.kl_coef != 0:
+                                    ref_noise_pred = unet_pretrained(
+                                        torch.cat([noised_latents] * 2),
+                                        torch.cat([timesteps] * 2),
+                                        embeds,
+                                    )
+                                    ref_noise_pred_uncond, ref_noise_pred_text = ref_noise_pred.chunk(2)
+                                    ref_noise_pred = (
+                                        ref_noise_pred_uncond
+                                        + config.sample.guidance_scale
+                                        * (ref_noise_pred_text - ref_noise_pred_uncond)
+                                    )
+                                
                             else:
                                 raise NotImplementedError("Not implemented yet")
                                 
                         loss = mse_loss(noise_pred, noise)
+                        
+                        if config.train.kl_coef != 0:
+                            kl_loss = config.train.kl_coef * (noise_pred - ref_noise_pred) ** 2
+                            loss = loss + kl_loss
+                            info["kl_loss"].append(kl_loss)
+                        
                         info["loss"].append(loss)
                         
                         # backward pass
@@ -779,6 +787,60 @@ def main(_):
                     
                         # if accelerator.sync_gradients:
                             # assert (int(config.train.gradient_steps_per_improve_step / (accelerator.num_processes * config.train.batch_size))) % config.train.gradient_accumulation_steps == 0
+                            
+            eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(
+                pipeline=pipeline,
+                prompt_embeds=prompt_embeds,
+                sample_neg_prompt_embeds=sample_neg_prompt_embeds,
+                config=config,
+                accelerator=accelerator,
+                epoch=epoch,
+                reward_fn=reward_fn,
+                executor=executor,
+                prompts=prompts,
+                prompt_metadata=prompt_metadata,
+                prompt_ids=prompt_ids,
+                autocast=autocast
+            )
+
+
+            for i, image in enumerate(eval_images_list):
+                pil = Image.fromarray(
+                    (image[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                )
+                pil = pil.resize((256, 256))
+                pil.save(os.path.join(save_dir, f"{epoch}_{i}_eval.jpg"))
+                
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for i, image in enumerate(eval_images_list[0]):
+                    pil = Image.fromarray(
+                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                    )
+                    pil = pil.resize((256, 256))
+                    pil.save(os.path.join(tmpdir, f"{i}_eval.jpg"))
+                    
+                accelerator.log(
+                    {
+                        "eval_images": [
+                            wandb.Image(
+                                os.path.join(tmpdir, f"{i}_eval.jpg"),
+                                caption=f"{prompt:.25} | {eval_reward:.2f}",
+                            )
+                            for i, (prompt, eval_reward) in enumerate(
+                                zip(prompts, eval_rewards)
+                            )  # only log rewards from process 0
+                        ],
+                    },
+                    step=global_step,
+                )
+
+            # log rewards and images
+            log_dict = {
+                "eval_reward": eval_rewards,
+                "eval_reward_mean": eval_rewards.mean(),
+                "eval_reward_std": eval_rewards.std(),
+            }
+            accelerator.log(log_dict, step=global_step)
 
 
             # make sure we did an optimization step at the end of the inner epoch
@@ -787,60 +849,7 @@ def main(_):
         if epoch != 0 and epoch % config.save_freq == 0 and accelerator.is_main_process:
             accelerator.save_state()
 
-        eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(
-            pipeline=pipeline,
-            prompt_embeds=prompt_embeds,
-            sample_neg_prompt_embeds=sample_neg_prompt_embeds,
-            config=config,
-            accelerator=accelerator,
-            epoch=epoch,
-            reward_fn=reward_fn,
-            executor=executor,
-            prompts=prompts,
-            prompt_metadata=prompt_metadata,
-            prompt_ids=prompt_ids,
-            autocast=autocast
-        )
 
-
-        for i, image in enumerate(eval_images_list):
-            pil = Image.fromarray(
-                (image[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-            )
-            pil = pil.resize((256, 256))
-            pil.save(os.path.join(save_dir, f"{epoch}_{i}_eval.jpg"))
-            
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for i, image in enumerate(eval_images_list[0]):
-                pil = Image.fromarray(
-                    (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-                )
-                pil = pil.resize((256, 256))
-                pil.save(os.path.join(tmpdir, f"{i}_eval.jpg"))
-                
-            accelerator.log(
-                {
-                    "eval_images": [
-                        wandb.Image(
-                            os.path.join(tmpdir, f"{i}_eval.jpg"),
-                            caption=f"{prompt:.25} | {eval_reward:.2f}",
-                        )
-                        for i, (prompt, eval_reward) in enumerate(
-                            zip(prompts, eval_rewards)
-                        )  # only log rewards from process 0
-                    ],
-                },
-                step=global_step,
-            )
-
-        # log rewards and images
-        log_dict = {
-            "eval_reward": eval_rewards,
-            "eval_reward_mean": eval_rewards.mean(),
-            "eval_reward_std": eval_rewards.std(),
-        }
-
-        accelerator.log(log_dict, step=global_step)
 
 
 if __name__ == "__main__":

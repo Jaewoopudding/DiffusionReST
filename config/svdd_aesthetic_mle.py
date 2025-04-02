@@ -15,7 +15,7 @@ def get_config():
     # samples.
     config.num_epochs = 10
     # number of epochs between saving model checkpoints.
-    config.save_freq = 1
+    config.save_freq = 10
     # number of checkpoints to keep before overwriting old ones.
     config.num_checkpoint_limit = 5
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
@@ -91,6 +91,8 @@ def get_config():
     train.gradient_steps_per_improve_step = 1000
     # number of total batch size used at improve step
     train.total_batch_size = 256
+    # kl regularizer coefficient
+    train.kl_coef = 0.01
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.

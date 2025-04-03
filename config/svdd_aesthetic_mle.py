@@ -92,11 +92,11 @@ def get_config():
     # number of total batch size used at improve step
     train.total_batch_size = 256
     # kl regularizer coefficient
-    train.kl_coef = 0.01
+    train.kl_coef = 0.00
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
-    config.prompt_fn = "imagenet_rottweiler"
+    config.prompt_fn = "imagenet_animals"
     # kwargs to pass to the prompt function.
     config.prompt_fn_kwargs = {}
 

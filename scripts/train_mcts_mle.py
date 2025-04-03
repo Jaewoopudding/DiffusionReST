@@ -139,7 +139,7 @@ def main(_):
         f'_B={config.sample.batch_size * config.sample.num_batches_per_epoch * torch.cuda.device_count()}'
         f'_M={config.search.duplicate}'
         f'_I={config.train.gradient_steps_per_improve_step}'
-        f'_KL={config.train_kl_coef}'
+        f'_KL={config.train.kl_coef}'
         f'_G={config.search.value_gradient}:{config.search.kl_lagrangian_coef}'
         f'_{datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")}'
         f'_{config.run_name}'
@@ -337,12 +337,12 @@ def main(_):
     # prepare prompt and reward fn
     prompt_fn = getattr(ddpo_pytorch.prompts, config.prompt_fn)
     
-    if "aesthetic" in config.reward_fn :
-        reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)(torch_dtype=inference_dtype)
-    else:
-        reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)()
+    # if "aesthetic" in config.reward_fn :
+    #     reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)(torch_dtype=inference_dtype)
+    # else:
+    #     reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)()
     # eval_fn = getattr(ddpo_pytorch.rewards, config.eval_fn)()
-
+    reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)()
     # generate negative prompt embeddings
     neg_prompt_embed = pipeline.text_encoder(
         pipeline.tokenizer(

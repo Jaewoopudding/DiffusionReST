@@ -138,9 +138,8 @@ def main(_):
         f'{config.reward_fn}'
         f'_B={config.sample.batch_size * config.sample.num_batches_per_epoch * torch.cuda.device_count()}'
         f'_M={config.search.duplicate}'
-        f'_NFE={config.search.nfe_per_action}'
-        f'_C={config.search.expansion_coef}'
-        f'_PW={config.search.pw_alpha}'
+        f'_I={config.train.gradient_steps_per_improve_step}'
+        f'_KL={config.train_kl_coef}'
         f'_G={config.search.value_gradient}:{config.search.kl_lagrangian_coef}'
         f'_{datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")}'
         f'_{config.run_name}'
@@ -528,7 +527,7 @@ def main(_):
                 (image[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
             )
             pil = pil.resize((256, 256))
-            pil.save(os.path.join(save_dir, f"{epoch}_{i}.jpg"))
+            pil.save(os.path.join(save_dir, f"{epoch}_{(i + 1) * (accelerator.local_process_index + 1)}_{samples['rewards'][i]:.4f}.jpg"))
 
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -588,7 +587,7 @@ def main(_):
                     (image[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
                 pil = pil.resize((256, 256))
-                pil.save(os.path.join(save_dir, f"{epoch}_{i}_eval.jpg"))
+                pil.save(os.path.join(save_dir, f"{epoch}_{(i + 1) * (accelerator.local_process_index + 1)}_eval_{eval_rewards[i]:.4f}.jpg"))
                 
             with tempfile.TemporaryDirectory() as tmpdir:
                 for i, image in enumerate(eval_images_list[0]):
@@ -641,8 +640,6 @@ def main(_):
             .to(accelerator.device)
         )
         
-        ## ReplayBuffer
-        
         samples_batched = {
             k: v.reshape(-1, config.train.batch_size, *v.shape[1:])
             for k, v in samples.items()
@@ -669,34 +666,6 @@ def main(_):
         #################### TRAINING ####################
         
         for improve_steps in range(config.train.improve_steps):
-            # shuffle samples along batch dimension
-            # perm = torch.randperm(total_batch_size, device=accelerator.device)
-            # samples = {k: v[perm] for k, v in samples.items()}
-
-            # shuffle along time dimension independently for each sample
-            # perms = torch.stack(
-            #     [
-            #         torch.randperm(num_timesteps, device=accelerator.device)
-            #         for _ in range(total_batch_size)
-            #     ]
-            # )
-            # for key in ["timesteps", "latents", "next_latents", "log_probs"]:
-            #     samples[key] = samples[key][
-            #         torch.arange(total_batch_size, device=accelerator.device)[:, None],
-            #         perms,
-            #     ]
-
-            # # rebatch for training
-            # samples_batched = {
-            #     k: v.reshape(-1, config.train.batch_size, *v.shape[1:])
-            #     for k, v in samples.items()
-            # }
-
-            # # dict of lists -> list of dicts for easier iteration
-            # samples_batched = [
-            #     dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
-            # ]
-            
             # train
             pipeline.unet.train()
             mse_loss = torch.nn.MSELoss()
@@ -813,7 +782,7 @@ def main(_):
                     (image[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
                 pil = pil.resize((256, 256))
-                pil.save(os.path.join(save_dir, f"{epoch}_{i}_eval.jpg"))
+                pil.save(os.path.join(save_dir, f"{epoch}_{(i + 1) * (accelerator.local_process_index + 1)}_eval_{eval_rewards[i]:.4f}.jpg"))
                 
             with tempfile.TemporaryDirectory() as tmpdir:
                 for i, image in enumerate(eval_images_list[0]):

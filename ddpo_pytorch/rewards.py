@@ -75,9 +75,7 @@ def clip_score(
         return loss_fn
 
 
-def aesthetic_score_diff(aesthetic_target=None,
-                     grad_scale=0,
-                     accelerator=None,
+def aesthetic_score_diff(
                      torch_dtype=None):
     from ddpo_pytorch.aesthetic_scorer import AestheticScorerDiff
     
@@ -93,12 +91,7 @@ def aesthetic_score_diff(aesthetic_target=None,
         im_pix = normalize(im_pix).to(im_pix_un.dtype)
         scorer_ = scorer.to(im_pix.device)
         rewards = scorer_(im_pix)
-        if aesthetic_target is None: # default maximization
-            loss = -1 * rewards
-        else:
-            # using L1 to keep on same scale
-            loss = abs(rewards - aesthetic_target)
-        return loss * grad_scale, rewards
+        return rewards, rewards
     return loss_fn
 
 

@@ -735,7 +735,7 @@ def main(_):
                         loss = mse_loss(noise_pred, noise)
                         
                         if config.train.kl_coef != 0:
-                            kl_loss = config.train.kl_coef * (noise_pred - ref_noise_pred) ** 2
+                            kl_loss = config.train.kl_coef * mse_loss(noise_pred, ref_noise_pred.detach())
                             loss = loss + kl_loss
                             info["kl_loss"].append(kl_loss)
                         

@@ -18,6 +18,6 @@
 # wandb login --relogin 4976cca9d8aba7c6e3ab132426742addc6ddedd3
 # # huggingface-cli login --token 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
 
-accelerate launch --main_process_port 29502 scripts/train_mcts_mle.py --config config/svdd_aesthetic_mle.py --config.search.value_gradient True --config.run_name svdd_mle_128_64_1000_mean_filter_1e5 --config.train.learning_rate 1e-5 --config.train.total_batch_size 64 --config.train.gradient_steps_per_improve_step 500 --config.train.improve_steps 6 --config.sample.num_batches_per_epoch 16
+CUDA_VISIBLE_DEVICES=3 accelerate launch scripts/train_mcts_mle.py --config config/svdd_aesthetic_mle.py --config.search.duplicate 1 --config.run_name svdd_mle_128_64_1000_mean_filter_1e5 --config.train.learning_rate 1e-5 --config.train.total_batch_size 1 --config.train.gradient_steps_per_improve_step 500 --config.train.improve_steps 6 --config.sample.num_batches_per_epoch 2
 # CUDA_VISIBLE_DEVICES=3,4,5,6 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py --config config/svdd_compressibility_64.py --config.run_name SVDD+PPO_comp 
-# CUDA_VISIBLE_DEVICES=3 accelerate launch --main_process_port 29502 scripts/train_mcts_mle.py --config config/svdd_aesthetic_mle_debug.py --config.run_name SVDD+MLEㅊ
+# CUDA_VISIBLE_DEVICES=3 accelerate launch --main_process_port 29502 scripts/train_mcts_mle.py --config config/svdd_aesthetic_mle_debug.py --config.run_name SVDD+MLEㅊs

@@ -27,6 +27,9 @@ def from_file(path, low=None, high=None):
     prompts = _load_lines(path)[low:high]
     return random.choice(prompts), {}
 
+def from_file_all(path, low=None, high=None):
+    prompts = _load_lines(path)[low:high]
+    return prompts, {}
 
 def imagenet_all():
     return from_file("imagenet_classes.txt")
@@ -35,6 +38,8 @@ def imagenet_all():
 def imagenet_animals():
     return from_file("imagenet_classes.txt", 0, 398)
 
+def imagenet_animals_all():
+    return from_file_all("imagenet_classes.txt", 0, 398)
 
 def imagenet_dogs():
     return from_file("imagenet_classes.txt", 151, 269)

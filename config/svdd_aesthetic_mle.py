@@ -53,7 +53,7 @@ def get_config():
     # number of batches to sample per epoch. the total number of samples per epoch is `num_batches_per_epoch *
     # batch_size * num_gpus`.
     sample.num_batches_per_epoch = 256
-    sample.num_prompts_per_batch = 4
+    sample.num_prompts_per_batch = 4 # for prompt-conditional buffer
 
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
@@ -98,7 +98,7 @@ def get_config():
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
     # config.prompt_fn = "imagenet_animals"
-    config.prompt_fn = "imagenet_animals_all"
+    config.prompt_fn = "imagenet_animals_all" # for prompt-conditional buffer
     # kwargs to pass to the prompt function.
     config.prompt_fn_kwargs = {}
 

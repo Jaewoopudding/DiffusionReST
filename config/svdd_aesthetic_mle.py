@@ -94,6 +94,8 @@ def get_config():
     train.total_batch_size = 256
     # kl regularizer coefficient
     train.kl_coef = 0.00
+    # DPO or SFT?
+    train.type = 'sft' # dpo or sft
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.

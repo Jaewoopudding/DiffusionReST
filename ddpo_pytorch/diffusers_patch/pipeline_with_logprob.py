@@ -172,7 +172,7 @@ def pipeline_with_logprob(
         prompt_embeds.dtype,
         device,
         generator,
-        latents,
+        latents.to(prompt_embeds.dtype),
     )
 
     # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
@@ -422,7 +422,7 @@ def tree_pipeline_with_logprob(
         generator,
         latents,
     )
-
+    prior = latents
     # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
     extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -494,4 +494,4 @@ def tree_pipeline_with_logprob(
     if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
         self.final_offload_hook.offload()
 
-    return image, has_nsfw_concept, all_latents, all_log_probs
+    return image, has_nsfw_concept, all_latents, all_log_probs, prior

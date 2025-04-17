@@ -18,8 +18,10 @@
 # wandb login --relogin 4976cca9d8aba7c6e3ab132426742addc6ddedd3
 # # huggingface-cli login --token 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
 
+
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 29502 scripts/train_mcts_mle.py \
 --config config/svdd_aesthetic_mle.py \
+--config.search.duplicate 1 \
 --config.run_name simple_animals_128/53-500*6 \
 --config.train.learning_rate 1e-5 \
 --config.train.total_batch_size 64 \
@@ -27,7 +29,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 29502 scripts
 --config.train.improve_steps 10 \
 --config.sample.num_batches_per_epoch 32 \
 --config.prompt_fn simple_animals \
---config.train.kl_coef 0.1 \
+--config.train.kl_coef 0.0 \
+--config.train.type 'sft' \
+--config.eval.num_images_per_prompt 8 \ ## YOU SHOUD SETS THIS AS SAME AS THE NUMBER OF DEVICES FOR FAST EVAL
+--config.sample.num_prompts_per_batch 4
+
 
 # CUDA_VISIBLE_DEVICES=3,4,5,6 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py --config config/svdd_compressibility_64.py --config.run_name SVDD+PPO_comp 
 # CUDA_VISIBLE_DEVICES=3 accelerate launch --main_process_port 29502 scripts/train_mcts_mle.py --config config/svdd_aesthetic_mle_debug.py --config.run_name SVDD+MLEㅊ

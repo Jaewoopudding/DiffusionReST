@@ -30,7 +30,9 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --main_process_port 29502 scripts/train
 --config.sample.num_batches_per_epoch 2 \
 --config.prompt_fn simple_animals \
 --config.train.kl_coef 0.0 \
---config.train.type 'sft'
+--config.train.type 'sft' \
+--config.eval.num_images_per_prompt 1 \
+--config.sample.num_prompts_per_batch 1
 
 # CUDA_VISIBLE_DEVICES=3,4,5,6 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py --config config/svdd_compressibility_64.py --config.run_name SVDD+PPO_comp 
 # CUDA_VISIBLE_DEVICES=3 accelerate launch --main_process_port 29502 scripts/train_mcts_mle.py --config config/svdd_aesthetic_mle_debug.py --config.run_name SVDD+MLEㅊs

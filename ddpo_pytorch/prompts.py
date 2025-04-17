@@ -32,24 +32,24 @@ def from_file_all(path, low=None, high=None):
     return prompts, {}
 
 def imagenet_all():
-    return from_file("imagenet_classes.txt")
+    return from_file_all("imagenet_classes.txt")
 
 
 def imagenet_animals():
-    return from_file("imagenet_classes.txt", 0, 398)
+    return from_file_all("imagenet_classes.txt", 0, 398)
 
 def imagenet_animals_all():
     return from_file_all("imagenet_classes.txt", 0, 398)
 
 def imagenet_dogs():
-    return from_file("imagenet_classes.txt", 151, 269)
+    return from_file_all("imagenet_classes.txt", 151, 269)
 
 
 def imagenet_rottweiler():
-    return from_file("imagenet_classes.txt", 234, 235)
+    return from_file_all("imagenet_classes.txt", 234, 235)
 
 def simple_animals():
-    return from_file("simple_animals.txt")
+    return from_file_all("simple_animals.txt")
 
 
 def nouns_activities(nouns_file, activities_file):

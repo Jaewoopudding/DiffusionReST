@@ -96,6 +96,7 @@ def get_config():
     train.kl_coef = 0.00
     # DPO or SFT?
     train.type = 'sft' # dpo or sft
+    train.beta_dpo = 5000
     
     config.eval = eval = ml_collections.ConfigDict()
     eval.num_images_per_prompt = 8

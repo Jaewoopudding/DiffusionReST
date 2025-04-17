@@ -29,8 +29,8 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --main_process_port 29502 scripts/train
 --config.train.improve_steps 2 \
 --config.sample.num_batches_per_epoch 2 \
 --config.prompt_fn simple_animals \
---config.train.kl_coef 0.0 \
---config.train.type 'sft' \
+--config.train.kl_coef 0.1 \
+--config.train.type 'dpo' \
 --config.eval.num_images_per_prompt 1 \
 --config.sample.num_prompts_per_batch 1
 

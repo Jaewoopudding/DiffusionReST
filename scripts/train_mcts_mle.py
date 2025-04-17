@@ -146,6 +146,7 @@ def main(_):
     
     config.run_name = (
         f'{config.reward_fn}'
+        f'_{config.train.type}'
         f'_B={config.sample.batch_size * config.sample.num_batches_per_epoch * torch.cuda.device_count()}'
         f'_M={config.search.duplicate}'
         f'_I={config.train.gradient_steps_per_improve_step}'
@@ -383,7 +384,7 @@ def main(_):
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
     # autocast = accelerator.autocast
     
-    if config.train.kl_coef > 0:
+    if config.train.kl_coef > 0 or config.train.type == 'dpo':
 
         unet_pretrained = UNet2DConditionModel.from_pretrained(
             config.pretrained.model,
@@ -751,17 +752,18 @@ def main(_):
                                     )
                                     
                                     if config.train.kl_coef > 0:
-                                        ref_noise_pred = unet_pretrained(
-                                            torch.cat([noised_latents] * 2),
-                                            torch.cat([timesteps] * 2),
-                                            embeds,
-                                        ).sample
-                                        ref_noise_pred_uncond, ref_noise_pred_text = ref_noise_pred.chunk(2)
-                                        ref_noise_pred = (
-                                            ref_noise_pred_uncond
-                                            + config.sample.guidance_scale
-                                            * (ref_noise_pred_text - ref_noise_pred_uncond)
-                                        )
+                                        with torch.no_grad():
+                                            ref_noise_pred = unet_pretrained(
+                                                torch.cat([noised_latents] * 2),
+                                                torch.cat([timesteps] * 2),
+                                                embeds,
+                                            ).sample
+                                            ref_noise_pred_uncond, ref_noise_pred_text = ref_noise_pred.chunk(2)
+                                            ref_noise_pred = (
+                                                ref_noise_pred_uncond
+                                                + config.sample.guidance_scale
+                                                * (ref_noise_pred_text - ref_noise_pred_uncond)
+                                            )
                                 else:
                                     raise NotImplementedError("Not implemented yet")
                                 loss = mse_loss(noise_pred, noise)
@@ -788,25 +790,23 @@ def main(_):
                                 model_diff = model_losses_w - model_losses_l
                                 
                                 with torch.no_grad():
-                                    ref_noise_pred = unet_pretrained((clean_latents, timesteps, embeds)).sample
+                                    ref_noise_pred = unet_pretrained(clean_latents, timesteps, embeds).sample
                                     ref_losses = (ref_noise_pred - noise.pow(2)).mean(dim=[1,2,3])
                                     ref_losses_w, ref_losses_l = ref_losses.chunk(2)
                                     ref_diff = ref_losses_w - ref_losses_l
                                     raw_ref_loss = ref_losses.mean()
                                     
-                                scale_term = -0.5 * config.beta_dpo
+                                scale_term = -0.5 * config.train.beta_dpo
                                 inside_term = scale_term * (model_diff - ref_diff)
                                 implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
                                 loss = -1 * torch.nn.functional.logsigmoid(inside_term).mean()
                                 
-                                avg_loss = accelerator.gather(loss.repeat(config.total_batch_size)).mean()
+                                avg_loss = accelerator.gather(loss.repeat(config.train.total_batch_size)).mean()
                                 info["avg_loss"].append(avg_loss)
-                                info["train_loss"].append(avg_loss.item() / config.gradient_accumulation_steps)
-                                info["avg_model_mse"].append(accelerator.gather(raw_model_loss.repeat(config.total_batch_size)).mean().item())
-                                info["avg_ref_mse"].append(accelerator.gather(raw_ref_loss.repeat(config.total_batch_size)).mean().item())
-                                info["avg_acc"].append(accelerator.gather(implicit_acc).mean().item())
-                                
-                                raise NotImplementedError("DPO training not implemented yet")
+                                info["train_loss"].append(avg_loss / int(config.train.total_batch_size / (torch.cuda.device_count())))
+                                info["avg_model_mse"].append(accelerator.gather(raw_model_loss.repeat(config.train.total_batch_size)).mean())
+                                info["avg_ref_mse"].append(accelerator.gather(raw_ref_loss.repeat(config.train.total_batch_size)).mean())
+                                info["avg_acc"].append(accelerator.gather(implicit_acc).mean())
                             else:
                                 raise ValueError("Unknown training type")
                                 

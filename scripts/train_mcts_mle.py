@@ -716,7 +716,8 @@ def main(_):
                 samples_from_buffer = []
                 for _ in range(int(config.train.total_batch_size / (accelerator.num_processes))):
                     buffer = buffers[random.choice(possible_idxs)]
-                    samples_from_buffer.extend(buffer.sample(1, target_threshold={"rewards": buffer.reward_median()}))
+                    threshold = -1e3 if config.train.type == 'dpo' else buffer.reward_median()
+                    samples_from_buffer.extend(buffer.sample(1, target_threshold={"rewards": threshold}))
                     
                 for j, sample in enumerate(tqdm(
                     samples_from_buffer,

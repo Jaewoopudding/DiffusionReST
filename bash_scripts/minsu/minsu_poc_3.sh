@@ -1,6 +1,6 @@
 wandb init --entity gda-for-orl --project ddpo-pytorch
 
-accelerate launch --main_process_port 29502 scripts/train_mcts_mle.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch --main_process_port 29503 scripts/train_mcts_mle.py \
 --config config/svdd_aesthetic_mle.py \
 --config.search.duplicate 10 \
 --config.run_name simple_animals_128/64-500*8_num_prompts_per_batch_non_kl \

@@ -3,8 +3,8 @@
 ## Installation
 
 ```bash
-conda activate DiffExIT
 conda env create -f environment.yml
+conda activate DiffExIT
 ```
 
 ## Usage

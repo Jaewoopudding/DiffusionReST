@@ -3,6 +3,7 @@
 ## Installation
 
 ```bash
+pip install -e. 
 conda env create -f environment.yml
 conda activate DiffExIT
 ```

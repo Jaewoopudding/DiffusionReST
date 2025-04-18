@@ -51,7 +51,7 @@ def generate_evaluation_samples(
     autocast,
     num_images_per_prompt: int=None
 ):
-    """s
+    """
     평가용 이미지를 생성하고, log_prob와 reward를 계산하여 eval_samples와 eval_images_list를 반환하는 함수입니다.
     """
     eval_images_list = []
@@ -91,7 +91,7 @@ def generate_evaluation_samples(
         eval_log_probs = torch.stack(eval_log_probs)
 
         # reward를 비동기로 계산
-        eval_rewards_future = executor.submit(reward_fn, eval_images, prompts_history[i], prompts_metadata_history[i])
+        eval_rewards_future = executor.submit(reward_fn, eval_images, prompts_history[i % len(prompts_history)], prompts_metadata_history[i % len(prompts_history)])
         time.sleep(0)  # 비동기 호출이 시작될 시간을 주기 위함
         timesteps = pipeline.scheduler.timesteps.repeat(
             config.sample.batch_size, 1
@@ -847,7 +847,7 @@ def main(_):
                 prompts_metadata_history=prompt_metadata_total_for_eval,
                 prior_history=prior_total_for_eval,
                 autocast=autocast,
-                num_images_per_prompt= 2 # config.eval.num_images_per_prompt // accelerator.num_processes,
+                num_images_per_prompt=1 # config.eval.num_images_per_prompt // accelerator.num_processes,
             )
 
             eval_images_tensor = torch.cat(eval_images_list)

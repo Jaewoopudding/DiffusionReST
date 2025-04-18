@@ -426,7 +426,7 @@ def main(_):
     assert config.sample.batch_size >= config.train.batch_size
     assert config.sample.batch_size % config.train.batch_size == 0
     assert config.train.total_batch_size % accelerator.num_processes == 0
-    assert config.eval.num_images_per_prompt % accelerator.num_processes == 0, "eval.num_prompts_per_batch must be devided  for now"
+    # assert config.eval.num_images_per_prompt % accelerator.num_processes == 0, "eval.num_prompts_per_batch must be devided  for now"
 
 
     if config.resume_from:
@@ -712,9 +712,12 @@ def main(_):
                 for i in range(num_prompts):
                     if len(buffers[i].buffer) > 0:
                         possible_idxs.append(i)
-                buffer = buffers[random.choice(possible_idxs)]
-                samples_from_buffer = buffer.sample(int(config.train.total_batch_size / (accelerator.num_processes)), target_threshold={"rewards": buffer.reward_median()})
-        
+
+                samples_from_buffer = []
+                for _ in range(int(config.train.total_batch_size / (accelerator.num_processes))):
+                    buffer = buffers[random.choice(possible_idxs)]
+                    samples_from_buffer.extend(buffer.sample(1, target_threshold={"rewards": buffer.reward_median()}))
+                    
                 for j, sample in enumerate(tqdm(
                     samples_from_buffer,
                     position=1,
@@ -844,7 +847,7 @@ def main(_):
                 prompts_metadata_history=prompt_metadata_total_for_eval,
                 prior_history=prior_total_for_eval,
                 autocast=autocast,
-                num_images_per_prompt=config.eval.num_images_per_prompt // accelerator.num_processes,
+                num_images_per_prompt= 2 # config.eval.num_images_per_prompt // accelerator.num_processes,
             )
 
             eval_images_tensor = torch.cat(eval_images_list)

@@ -154,7 +154,7 @@ def main(_):
         f'_G={config.search.value_gradient}:{config.search.kl_lagrangian_coef}'
         f'_{datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")}'
         f'_{config.run_name}'
-)
+    )
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.logdir, config.run_name),
         automatic_checkpoint_naming=True,
@@ -527,7 +527,8 @@ def main(_):
                     ],  # each entry is the latent after timestep t
                     "log_probs": log_probs,
                     "rewards": rewards,
-                    # "evals": evals
+                    # "evals": evals,
+                    "final_embedding": latents[:, -1]
                 }
             )
             
@@ -553,12 +554,11 @@ def main(_):
         save_dir = f'images/{config.run_name}'
         os.makedirs(save_dir, exist_ok=True) 
 
-        for i, image in enumerate(images_list):
+        for i, (image, prompt) in enumerate(zip(images_list, prompts_history)):
             pil = Image.fromarray(
                 (image[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
             )
-            pil = pil.resize((256, 256))
-            pil.save(os.path.join(save_dir, f"G:{epoch+1}_search_{(i + 1) * (accelerator.local_process_index + 1)}_{samples['rewards'][i]:.4f}.jpg"))
+            pil.save(os.path.join(save_dir, f"G:{epoch+1}_{prompt}_search_{(i + 1) * (accelerator.local_process_index + 1)}_{samples['rewards'][i]:.4f}.jpg"))
 
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -617,7 +617,6 @@ def main(_):
                 pil = Image.fromarray(
                     (image[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
-                pil = pil.resize((256, 256))
                 pil.save(os.path.join(save_dir, f"{epoch}_{(i + 1) * (accelerator.local_process_index + 1)}_eval_{eval_rewards[i]:.4f}.jpg"))
                 
             # with tempfile.TemporaryDirectory() as tmpdir:
@@ -853,12 +852,11 @@ def main(_):
 
             eval_images_tensor = torch.cat(eval_images_list)
             
-            for i, image in enumerate(eval_images_tensor):
+            for i, (image, prompt) in enumerate(zip(eval_images_tensor, prompts_total)):
                 pil = Image.fromarray(
                     (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
-                pil = pil.resize((256, 256))
-                pil.save(os.path.join(save_dir, f"G:{epoch+1}_I:{improve_steps+1}_{(i + 1) * (accelerator.local_process_index + 1)}_eval_{eval_rewards[i]:.4f}.jpg"))
+                pil.save(os.path.join(save_dir, f"G:{epoch+1}_I:{improve_steps+1}_{prompt}_{(i + 1) * (accelerator.local_process_index + 1)}_eval_{eval_rewards[i]:.4f}.jpg"))
                 
             with tempfile.TemporaryDirectory() as tmpdir:
                 eval_images = eval_images_list[0]  # 명확하게 지정

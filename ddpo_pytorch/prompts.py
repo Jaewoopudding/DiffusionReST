@@ -51,6 +51,9 @@ def imagenet_rottweiler():
 def simple_animals():
     return from_file_all("simple_animals.txt")
 
+def simple_animals_ddpo():
+    return from_file("simple_animals.txt")
+
 
 def nouns_activities(nouns_file, activities_file):
     nouns = _load_lines(nouns_file)

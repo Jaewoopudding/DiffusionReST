@@ -36,6 +36,105 @@ config_flags.DEFINE_config_file("config", "config/base.py", "Training configurat
 logger = get_logger(__name__)
 
 
+def generate_evaluation_samples(
+    pipeline,
+    sample_neg_prompt_embeds,
+    config,
+    accelerator,
+    epoch,
+    reward_fn,
+    executor,
+    prompts_history,
+    prompts_metadata_history,
+    prior_history,
+    autocast,
+    num_images_per_prompt: int=None
+):
+    """
+    평가용 이미지를 생성하고, log_prob와 reward를 계산하여 eval_samples와 eval_images_list를 반환하는 함수입니다.
+    """
+    eval_images_list = []
+    eval_samples = []
+    eval_rewards_list = []
+    
+    # 평가용 이미지 및 log_prob 샘플링
+    for i in tqdm(
+        range(config.sample.num_batches_per_epoch) if num_images_per_prompt is None else range(len(prompts_history) * num_images_per_prompt),
+        desc=f"Epoch {epoch}: sampling for evaluation",
+        disable=not accelerator.is_local_main_process,
+        position=0,
+    ):
+        prompt_ids = pipeline.tokenizer(
+            prompts_history[i % len(prompts_history)],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=pipeline.tokenizer.model_max_length,
+        ).input_ids.to(accelerator.device)
+        prompt_embeds = pipeline.text_encoder(prompt_ids)[0]
+        
+        with autocast():
+            eval_images, _, eval_latents, eval_log_probs = pipeline_with_logprob(
+                pipeline,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=sample_neg_prompt_embeds,
+                num_inference_steps=config.sample.num_steps,
+                guidance_scale=config.sample.guidance_scale,
+                eta=config.sample.eta,
+                output_type="pt",
+            )
+            eval_images_list.append(eval_images)
+        
+        eval_latents = torch.stack(eval_latents, dim=1)
+        eval_log_probs = torch.stack(eval_log_probs)
+
+        # reward를 비동기로 계산
+        eval_rewards_future = executor.submit(reward_fn, eval_images, prompts_history[i % len(prompts_history)], prompts_metadata_history[i % len(prompts_history)])
+        time.sleep(0)  # 비동기 호출이 시작될 시간을 주기 위함
+        timesteps = pipeline.scheduler.timesteps.repeat(
+            config.sample.batch_size, 1
+        )
+        eval_samples.append(
+            {
+                "prompt_ids": prompt_ids,
+                "prompt_embeds": prompt_embeds,
+                "timesteps": timesteps,
+                "latents": eval_latents[:, :-1],   # 각 timestep 이전의 latent
+                "next_latents": eval_latents[:, 1:], # 각 timestep 이후의 latent
+                "log_probs": eval_log_probs,
+                "eval_rewards": eval_rewards_future,
+            }
+        )
+    
+    # 비동기로 계산된 reward를 기다리고, 결과를 텐서로 변환
+    for sample in tqdm(
+        eval_samples,
+        desc="Waiting for rewards",
+        disable=not accelerator.is_local_main_process,
+        position=0,
+    ):
+        eval_rewards, _ = sample["eval_rewards"].result()
+        sample["eval_rewards"] = torch.as_tensor(eval_rewards, device=accelerator.device)
+        eval_rewards_list.append(sample["eval_rewards"])
+        # 추가 eval 결과를 텐서로 변환 (여기서는 key가 지정된 항목들을 제외한 나머지)
+        eval_results = {
+            key: torch.as_tensor(value, device=accelerator.device)
+            for key, value in sample.items()
+            if key not in ["prompt_ids", "prompt_embeds", "timesteps", "latents", "next_latents", "log_probs", "rewards"]
+        }
+        sample.update(eval_results)
+
+    eval_samples_collated = {
+        k: torch.cat([
+            torch.as_tensor(s[k], device=accelerator.device) if isinstance(s[k], np.ndarray) else s[k]
+            for s in eval_samples
+        ])
+        for k in eval_samples[0].keys()
+    }
+
+    return eval_samples_collated, eval_images_list, torch.cat(eval_rewards_list)
+
+
 def main(_):
     # basic Accelerate and logging setup
     config = FLAGS.config
@@ -508,12 +607,9 @@ def main(_):
                 ):
                     with accelerator.accumulate(unet):
                         with autocast():
+                            breakpoint()
                             if config.train.cfg:
-                                noise_pred = unet(
-                                    torch.cat([sample["latents"][:, j]] * 2),
-                                    torch.cat([sample["timesteps"][:, j]] * 2),
-                                    embeds,
-                                ).sample
+                                noise_pred = unet(torch.cat([sample["latents"][:, j]] * 2),torch.cat([sample["timesteps"][:, j]] * 2),embeds,).sample
                                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                                 noise_pred = (
                                     noise_pred_uncond
@@ -595,7 +691,64 @@ def main(_):
 
         if epoch != 0 and epoch % config.save_freq == 0 and accelerator.is_main_process:
             accelerator.save_state()
-
+            
+        if epoch % 10 == 0:
+            from ddpo_pytorch.prompts import simple_animals
+            prompts_total, prompt_metadata = simple_animals(**config.prompt_fn_kwargs)
+            eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(
+                pipeline=pipeline,
+                sample_neg_prompt_embeds=sample_neg_prompt_embeds,
+                config=config,
+                accelerator=accelerator,
+                epoch=epoch,
+                reward_fn=reward_fn,
+                executor=executor,
+                prompts_history=prompts_total,
+                prompts_metadata_history=[{} for _ in range(len(prompts_total))] ,
+                prior_history=None,
+                autocast=autocast,
+                num_images_per_prompt=1 # config.eval.num_images_per_prompt // accelerator.num_processes,
+            )
+            
+            eval_images_tensor = torch.cat(eval_images_list)
+            save_dir = f'images/{config.run_name}'
+            os.makedirs(save_dir, exist_ok=True) 
+            for i, (image, prompt) in enumerate(zip(eval_images_tensor, prompts_total)):
+                pil = Image.fromarray(
+                    (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                )
+                pil.save(os.path.join(save_dir, f"G:{epoch+1}_{prompt}_{(i + 1) * (accelerator.local_process_index + 1)}_eval_{eval_rewards[i]:.4f}.jpg"))
+                
+            with tempfile.TemporaryDirectory() as tmpdir:
+                eval_images = eval_images_list[0]  # 명확하게 지정
+                for i, image in enumerate(eval_images):
+                    pil = Image.fromarray(
+                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                    )
+                    pil = pil.resize((256, 256))
+                    pil.save(os.path.join(tmpdir, f"{i}_eval.jpg"))
+                
+                accelerator.log(
+                    {
+                        "eval_images": [
+                            wandb.Image(
+                                os.path.join(tmpdir, f"{i}_eval.jpg"),
+                                caption=f"{prompt:.25} | {eval_reward:.2f}",
+                            )
+                            for i, (prompt, eval_reward) in enumerate(
+                                zip(prompts[:len(eval_images_list[0])], eval_rewards[:len(eval_images_list[0])])
+                            )
+                        ],
+                    },
+                    step=global_step,
+                )
+            # log rewards and images
+            log_dict = {
+                "eval_reward": eval_rewards,
+                "eval_reward_mean": eval_rewards.mean(),
+                "eval_reward_std": eval_rewards.std(),
+            }
+            accelerator.log(log_dict, step=global_step)
 
 if __name__ == "__main__":
     app.run(main)

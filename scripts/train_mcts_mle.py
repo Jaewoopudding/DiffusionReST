@@ -786,7 +786,7 @@ def main(_):
                                 embeds = sample["prompt_embeds"].repeat(2, 1, 1)
                                 
                                 model_pred = unet(clean_latents, timesteps, embeds).sample
-                                model_losses = (model_pred - noise.pow(2)).mean(dim=[1,2,3])
+                                model_losses = (model_pred - noise).pow(2).mean(dim=[1,2,3])
                                 model_losses_w, model_losses_l = model_losses.chunk(2)
                                 
                                 raw_model_loss = (model_losses_w.mean() - model_losses_l.mean())
@@ -794,7 +794,7 @@ def main(_):
                                 
                                 with torch.no_grad():
                                     ref_noise_pred = unet_pretrained(clean_latents, timesteps, embeds).sample
-                                    ref_losses = (ref_noise_pred - noise.pow(2)).mean(dim=[1,2,3])
+                                    ref_losses = (ref_noise_pred - noise).pow(2).mean(dim=[1,2,3])
                                     ref_losses_w, ref_losses_l = ref_losses.chunk(2)
                                     ref_diff = ref_losses_w - ref_losses_l
                                     raw_ref_loss = ref_losses.mean()

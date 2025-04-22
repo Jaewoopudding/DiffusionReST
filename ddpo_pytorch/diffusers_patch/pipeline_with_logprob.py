@@ -172,7 +172,7 @@ def pipeline_with_logprob(
         prompt_embeds.dtype,
         device,
         generator,
-        latents.to(prompt_embeds.dtype),
+        latents.to(prompt_embeds.dtype) if latents is not None else None,
     )
 
     # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline

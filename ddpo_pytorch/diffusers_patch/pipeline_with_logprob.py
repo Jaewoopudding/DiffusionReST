@@ -421,7 +421,7 @@ def tree_pipeline_with_logprob(
         device,
         generator,
         latents,
-    )
+    ).to(prompt_embeds.dtype)
     
     # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
     extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -444,7 +444,6 @@ def tree_pipeline_with_logprob(
         prompt_metadata=prompt_metadata
     ) 
     prior = tree.select(tree.UCT).states
-    
     all_latents = []
     all_log_probs = []
     
@@ -455,7 +454,7 @@ def tree_pipeline_with_logprob(
             for _ in tqdm(range(config.search.nfe_per_action), position=3, desc="NFE Budget", leave=False, disable=True):
                 current_nodes = tree.select(select_fn=tree.UCT)
                 tree.expand(nodes=current_nodes, use_gradient=config.search.value_gradient, jump=config.search.jump_policy)    
-            tree.act_and_prune(select_fn=tree.max_value, prune=True)  
+            tree.act_and_prune(select_fn=tree.max_value, prune=False)  
             latents = tree.root_nodes.states
             
             all_latents.append(latents)
@@ -495,4 +494,4 @@ def tree_pipeline_with_logprob(
     if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
         self.final_offload_hook.offload()
 
-    return image, has_nsfw_concept, all_latents, all_log_probs, prior
+    return image, has_nsfw_concept, all_latents, all_log_probs, prior, tree

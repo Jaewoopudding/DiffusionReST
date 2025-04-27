@@ -181,6 +181,7 @@ class TreePolicy:
         
         # initial node for x_T starting point
         self.root_nodes = BatchedNode(node_list)
+        self.initial_nodes = self.root_nodes
         self.root_nodes.add_children(
             initial_children.view(1, config.search.duplicate * config.search.nfe_per_action, *initial_children.shape[1:]), 
             torch.ones(1, config.search.duplicate * config.search.nfe_per_action, device=self.device) * pipeline.scheduler.timesteps[0]
@@ -234,7 +235,7 @@ class TreePolicy:
         
         grad_mode = torch.enable_grad() if use_gradient else torch.no_grad()
         with grad_mode:
-            latent = nodes.states.detach().to(torch.float32)
+            latent = nodes.states.detach().to(self.pipeline.unet.dtype)
             if use_gradient:
                 latent.requires_grad_(True)
             if self.do_classifier_free_guidance:
@@ -410,3 +411,9 @@ class TreePolicy:
 
     def max_value(self, parent_visits_tensor, child_values, child_visits):
         return torch.argmax(child_values / child_visits).item()
+    
+    def reset_root_nodes(self):
+        self.root_nodes = self.initial_nodes
+        
+    def argmax_value(self, parent_visits_tensor, child_values, child_visits):
+        return torch.argmax(child_values).item()

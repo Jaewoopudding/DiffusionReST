@@ -108,10 +108,10 @@ def get_config():
     # kwargs to pass to the prompt function.
     config.prompt_fn_kwargs = {}
 
-    ###### Reward Function ######
     # reward function to use. see `rewards.py` for available reward functions.
     config.reward_fn = "aesthetic_score" # aesthetic_score jpeg_compressibility
     config.eval_fn = "multi_reward_evaluation"
+    config.tree_amortization = 'offline_RL'
 
     ###### Per-Prompt Stat Tracking ######
     # when enabled, the model will track the mean and std of reward on a per-prompt basis and use that to compute

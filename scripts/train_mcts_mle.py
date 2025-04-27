@@ -32,7 +32,7 @@ tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 
 FLAGS = flags.FLAGS
-config_flags.DEFINE_config_file("config", "config/svdd_aesthetic_1.py", "Training configuration.")
+config_flags.DEFINE_config_file("config", "config/svdd_aesthetic_mle.py", "Training configuration.")
 
 logger = get_logger(__name__)
 
@@ -177,6 +177,8 @@ def main(_):
                 sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
             )
 
+
+    
     accelerator = Accelerator(
         log_with="wandb",
         mixed_precision=config.mixed_precision,
@@ -184,7 +186,7 @@ def main(_):
         # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
         # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
         # the total number of optimizer steps to accumulate across.
-        gradient_accumulation_steps=int(config.train.total_batch_size / (torch.cuda.device_count()))
+        gradient_accumulation_steps= num_train_timesteps # int(config.train.total_batch_size / (torch.cuda.device_count()))
     )
     
     if accelerator.is_main_process:
@@ -425,7 +427,7 @@ def main(_):
 
     assert config.sample.batch_size >= config.train.batch_size
     assert config.sample.batch_size % config.train.batch_size == 0
-    assert config.train.total_batch_size % accelerator.num_processes == 0
+    # assert config.train.total_batch_size % accelerator.num_processes == 0
     # assert config.eval.num_images_per_prompt % accelerator.num_processes == 0, "eval.num_prompts_per_batch must be devided  for now"
 
 
@@ -479,7 +481,7 @@ def main(_):
                 shape = (config.search.duplicate * config.search.nfe_per_action, 4, 64, 64)
                 init_latents = torch.randn(shape, device=accelerator.device)
                 pipeline.batch_size = 1
-                images, _, latents, log_probs, prior = tree_pipeline_with_logprob(
+                images, _, latents, log_probs, prior, tree = tree_pipeline_with_logprob(
                     pipeline,
                     config=config,
                     reward_fn=reward_fn,
@@ -493,7 +495,6 @@ def main(_):
                     prompts=prompt,
                     prompt_metadata=prompt_metadata,
                 )
-
                 images_list.append(images)
                 prior_history.append(prior)
                 prompts_history.append(prompt)
@@ -528,10 +529,11 @@ def main(_):
                     "log_probs": log_probs,
                     "rewards": rewards,
                     # "evals": evals,
-                    "final_embedding": latents[:, -1]
+                    "final_embedding": latents[:, -1],
+                    "tree": tree
                 }
             )
-            
+
         # wait for all rewards to be computed
         for sample in tqdm(
             samples,
@@ -542,12 +544,14 @@ def main(_):
             rewards, reward_metadata = sample["rewards"].result()
             sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
             # eval_results = sample["evals"].result()
-            eval_results = {key: torch.as_tensor(value, device=accelerator.device) for key, value in sample.items() if key not in ["prompt_ids", "prompt_embeds", "timesteps", "latents", "next_latents", "log_probs", "rewards"]}
+            eval_results = {key: torch.as_tensor(value, device=accelerator.device) for key, value in sample.items() if key not in ["prompt_ids", "prompt_embeds", "timesteps", "latents", "next_latents", "log_probs", "rewards", "tree"]}
             sample.update(eval_results)
             # del sample["evals"]
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
-        samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
+        trees = [sample['tree'] for sample in samples]
+        samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()if k != 'tree'}
+        samples['trees'] = trees
 
         # this is a hack to force wandb to log the images as JPEGs instead of PNGs
 
@@ -671,7 +675,7 @@ def main(_):
         )
         
         samples_batched = {
-            k: v.reshape(-1, config.train.batch_size, *v.shape[1:])
+            k: v.reshape(-1, config.train.batch_size, *v.shape[1:]) if k != 'trees' else v
             for k, v in samples.items()
         }
 
@@ -700,139 +704,206 @@ def main(_):
             mse_loss = torch.nn.MSELoss()
             info = defaultdict(list)
             
-            for step in tqdm(
-                range(config.train.gradient_steps_per_improve_step),
-                desc=f"Grow: {epoch + 1} | Improve {improve_steps + 1} | Total gradient steps {config.train.gradient_steps_per_improve_step} ",
-                position=0,
-                leave=True,
-                disable=not accelerator.is_local_main_process,
-            ):
-                possible_idxs = []
-                for i in range(num_prompts):
-                    if len(buffers[i].buffer) > 0:
-                        possible_idxs.append(i)
-
-                samples_from_buffer = []
-                for _ in range(int(config.train.total_batch_size / (accelerator.num_processes))):
-                    buffer = buffers[random.choice(possible_idxs)]
-                    threshold = -1e3 if config.train.type == 'dpo' else buffer.reward_median()
-                    samples_from_buffer.extend(buffer.sample(1, target_threshold={"rewards": threshold}))
-                    
-                for j, sample in enumerate(tqdm(
-                    samples_from_buffer,
-                    position=1,
-                    leave=False,
-                    desc=f'Grow: {epoch + 1} | Improve {improve_steps + 1} | Batch Iteration',
-                    disable=not accelerator.is_local_main_process,)
+            if config.tree_amortization:        
+                for i, sample in tqdm(
+                    list(enumerate(samples_batched)),
+                    desc=f"Epoch {epoch}.{improve_steps}: training",
+                    position=0,
+                    disable=not accelerator.is_local_main_process,
                 ):
-                    with accelerator.accumulate(unet):
-                        with autocast():
-                            if config.train.type == 'sft':
-                                if config.train.cfg:
-                                    # concat negative prompts to sample prompts to avoid two forward passes
-                                    embeds = torch.cat(
-                                        [train_neg_prompt_embeds, sample["prompt_embeds"]]
-                                    )
+                    embeds = torch.cat([train_neg_prompt_embeds, sample["prompt_embeds"]])
+                    search_tree = sample['trees']
+                    search_tree.reset_root_nodes()
+                    
+                    for j in tqdm(
+                        range(num_train_timesteps),
+                        desc="Timestep",
+                        position=1,
+                        leave=False,
+                        disable=not accelerator.is_local_main_process,
+                    ):
+                        search_tree.act_and_prune(tree.argmax_value, prune=False)
+                        with accelerator.accumulate(unet):
+                            with autocast():
+                                current_nodes = search_tree.root_nodes
+                                latents = current_nodes.states
+                                timesteps = current_nodes.timesteps
+                                print(timesteps)
+                                
+                                noise_pred = unet(torch.cat([latents] * 2),torch.cat([timesteps] * 2),embeds,).sample
+                                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                                noise_pred = (
+                                    noise_pred_uncond
+                                    + config.sample.guidance_scale
+                                    * (noise_pred_text - noise_pred_uncond)
+                                )
+                                
+                                child_rewards = torch.tensor([child.reward for child in current_nodes.get_children()[0]], dtype=torch.float32, device=accelerator.device).view(-1, 1)
+                                advantages = ((child_rewards - child_rewards.mean()) / (child_rewards.std() + 1e-8))
+                            advantages = torch.clamp(advantages,-config.train.adv_clip_max, config.train.adv_clip_max )
+                            for idx, child in enumerate(current_nodes.get_children()[0]):
+                                _, log_prob = ddim_step_with_logprob(
+                                    pipeline.scheduler,
+                                    noise_pred,
+                                    timesteps.to(torch.int64),
+                                    latents,
+                                    eta=config.sample.eta,
+                                    prev_sample=child.state
+                                )
+                                loss = advantages[idx] * log_prob
+                                info['loss'].append(loss)
+                                
+                                if idx ==  len(current_nodes.get_children()[0]) - 1:
+                                    accelerator.backward(loss)
                                 else:
-                                    embeds = sample["prompt_embeds"]
-                            
-                                if config.train.cfg:
-                                    clean_latents = sample["latents"][:, -1]
-                                    timesteps = torch.randint(0, pipeline.scheduler.config.num_train_timesteps, (config.train.batch_size,), device=accelerator.device)
-                                    noise = torch.randn_like(clean_latents)
-                                    noised_latents = pipeline.scheduler.add_noise(clean_latents, noise, timesteps)
-
-                                    noise_pred = unet(
-                                        torch.cat([noised_latents] * 2),
-                                        torch.cat([timesteps] * 2),
-                                        embeds,
-                                    ).sample
-                                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                                    noise_pred = (
-                                        noise_pred_uncond
-                                        + config.sample.guidance_scale
-                                        * (noise_pred_text - noise_pred_uncond)
+                                    accelerator.backward(loss, retain_graph=True)
+                                if accelerator.sync_gradients:
+                                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                                    info = accelerator.reduce(info, reduction="mean")
+                                    info.update({"epoch": epoch, "improve_steps": improve_steps})
+                                    accelerator.log(info, step=global_step)
+                                    global_step += 1
+                                    info = defaultdict(list)
+                                    accelerator.clip_grad_norm_(
+                                        unet.parameters(), config.train.max_grad_norm
                                     )
+                                optimizer.step()
+                                optimizer.zero_grad()
+                    
+            
+            else:
+                for step in tqdm(
+                    range(config.train.gradient_steps_per_improve_step),
+                    desc=f"Grow: {epoch + 1} | Improve {improve_steps + 1} | Total gradient steps {config.train.gradient_steps_per_improve_step} ",
+                    position=0,
+                    leave=True,
+                    disable=not accelerator.is_local_main_process,
+                ):
+                    possible_idxs = []
+                    for i in range(num_prompts):
+                        if len(buffers[i].buffer) > 0:
+                            possible_idxs.append(i)
+                    samples_from_buffer = []
+                    for _ in range(int(config.train.total_batch_size / (accelerator.num_processes))):
+                        buffer = buffers[random.choice(possible_idxs)]
+                        threshold = -1e3 if config.train.type == 'dpo' else buffer.reward_median()
+                        samples_from_buffer.extend(buffer.sample(1, target_threshold={"rewards": threshold}))
+                        
+                    for j, sample in enumerate(tqdm(
+                        samples_from_buffer,
+                        position=1,
+                        leave=False,
+                        desc=f'Grow: {epoch + 1} | Improve {improve_steps + 1} | Batch Iteration',
+                        disable=not accelerator.is_local_main_process,)
+                    ):
+                        with accelerator.accumulate(unet):
+                            with autocast():
+                                if config.train.type == 'sft':
+                                    if config.train.cfg:
+                                        # concat negative prompts to sample prompts to avoid two forward passes
+                                        embeds = torch.cat(
+                                            [train_neg_prompt_embeds, sample["prompt_embeds"]]
+                                        )
+                                    else:
+                                        embeds = sample["prompt_embeds"]
+                                
+                                    if config.train.cfg:
+                                        clean_latents = sample["latents"][:, -1]
+                                        timesteps = torch.randint(0, pipeline.scheduler.config.num_train_timesteps, (config.train.batch_size,), device=accelerator.device)
+                                        noise = torch.randn_like(clean_latents)
+                                        noised_latents = pipeline.scheduler.add_noise(clean_latents, noise, timesteps)
+
+                                        noise_pred = unet(
+                                            torch.cat([noised_latents] * 2),
+                                            torch.cat([timesteps] * 2),
+                                            embeds,
+                                        ).sample
+                                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                                        noise_pred = (
+                                            noise_pred_uncond
+                                            + config.sample.guidance_scale
+                                            * (noise_pred_text - noise_pred_uncond)
+                                        )
+                                        
+                                        if config.train.kl_coef > 0:
+                                            with torch.no_grad():
+                                                ref_noise_pred = unet_pretrained(
+                                                    torch.cat([noised_latents] * 2),
+                                                    torch.cat([timesteps] * 2),
+                                                    embeds,
+                                                ).sample
+                                                ref_noise_pred_uncond, ref_noise_pred_text = ref_noise_pred.chunk(2)
+                                                ref_noise_pred = (
+                                                    ref_noise_pred_uncond
+                                                    + config.sample.guidance_scale
+                                                    * (ref_noise_pred_text - ref_noise_pred_uncond)
+                                                )
+                                    else:
+                                        raise NotImplementedError("Not implemented yet")
+                                    loss = mse_loss(noise_pred, noise)
                                     
                                     if config.train.kl_coef > 0:
-                                        with torch.no_grad():
-                                            ref_noise_pred = unet_pretrained(
-                                                torch.cat([noised_latents] * 2),
-                                                torch.cat([timesteps] * 2),
-                                                embeds,
-                                            ).sample
-                                            ref_noise_pred_uncond, ref_noise_pred_text = ref_noise_pred.chunk(2)
-                                            ref_noise_pred = (
-                                                ref_noise_pred_uncond
-                                                + config.sample.guidance_scale
-                                                * (ref_noise_pred_text - ref_noise_pred_uncond)
-                                            )
-                                else:
-                                    raise NotImplementedError("Not implemented yet")
-                                loss = mse_loss(noise_pred, noise)
-                                
-                                if config.train.kl_coef > 0:
-                                    kl_loss = config.train.kl_coef * mse_loss(noise_pred, ref_noise_pred.detach())
-                                    loss = loss + kl_loss
-                                    info["kl_loss"].append(kl_loss)
-                                info["loss"].append(loss)
-                                
-                            elif config.train.type == 'dpo':
-                                clean_latents = torch.cat([sample["latents"][:, -1], sample["eval_latents"][:, -1]])
-                                timesteps = torch.randint(0, pipeline.scheduler.config.num_train_timesteps, (config.train.batch_size,), device=accelerator.device)
-                                timesteps = timesteps.long().chunk(2)[0].repeat(2)
-                                noise = torch.randn_like(clean_latents)
-                                noised_latents = pipeline.scheduler.add_noise(clean_latents, noise, timesteps)
-                                embeds = sample["prompt_embeds"].repeat(2, 1, 1)
-                                
-                                model_pred = unet(clean_latents, timesteps, embeds).sample
-                                model_losses = (model_pred - noise).pow(2).mean(dim=[1,2,3])
-                                model_losses_w, model_losses_l = model_losses.chunk(2)
-                                
-                                raw_model_loss = (model_losses_w.mean() - model_losses_l.mean())
-                                model_diff = model_losses_w - model_losses_l
-                                
-                                with torch.no_grad():
-                                    ref_noise_pred = unet_pretrained(clean_latents, timesteps, embeds).sample
-                                    ref_losses = (ref_noise_pred - noise).pow(2).mean(dim=[1,2,3])
-                                    ref_losses_w, ref_losses_l = ref_losses.chunk(2)
-                                    ref_diff = ref_losses_w - ref_losses_l
-                                    raw_ref_loss = ref_losses.mean()
+                                        kl_loss = config.train.kl_coef * mse_loss(noise_pred, ref_noise_pred.detach())
+                                        loss = loss + kl_loss
+                                        info["kl_loss"].append(kl_loss)
+                                    info["loss"].append(loss)
                                     
-                                scale_term = -0.5 * config.train.beta_dpo
-                                inside_term = scale_term * (model_diff - ref_diff)
-                                implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
-                                loss = -1 * torch.nn.functional.logsigmoid(inside_term).mean()
-                                
-                                avg_loss = accelerator.gather(loss.repeat(config.train.total_batch_size)).mean()
-                                info["avg_loss"].append(avg_loss)
-                                info["train_loss"].append(avg_loss / int(config.train.total_batch_size / (torch.cuda.device_count())))
-                                info["avg_model_mse"].append(accelerator.gather(raw_model_loss.repeat(config.train.total_batch_size)).mean())
-                                info["avg_ref_mse"].append(accelerator.gather(raw_ref_loss.repeat(config.train.total_batch_size)).mean())
-                                info["avg_acc"].append(accelerator.gather(implicit_acc).mean())
-                            else:
-                                raise ValueError("Unknown training type")
-                                
+                                elif config.train.type == 'dpo':
+                                    clean_latents = torch.cat([sample["latents"][:, -1], sample["eval_latents"][:, -1]])
+                                    timesteps = torch.randint(0, pipeline.scheduler.config.num_train_timesteps, (config.train.batch_size,), device=accelerator.device)
+                                    timesteps = timesteps.long().chunk(2)[0].repeat(2)
+                                    noise = torch.randn_like(clean_latents)
+                                    noised_latents = pipeline.scheduler.add_noise(clean_latents, noise, timesteps)
+                                    embeds = sample["prompt_embeds"].repeat(2, 1, 1)
+                                    
+                                    model_pred = unet(clean_latents, timesteps, embeds).sample
+                                    model_losses = (model_pred - noise).pow(2).mean(dim=[1,2,3])
+                                    model_losses_w, model_losses_l = model_losses.chunk(2)
+                                    
+                                    raw_model_loss = (model_losses_w.mean() - model_losses_l.mean())
+                                    model_diff = model_losses_w - model_losses_l
+                                    
+                                    with torch.no_grad():
+                                        ref_noise_pred = unet_pretrained(clean_latents, timesteps, embeds).sample
+                                        ref_losses = (ref_noise_pred - noise).pow(2).mean(dim=[1,2,3])
+                                        ref_losses_w, ref_losses_l = ref_losses.chunk(2)
+                                        ref_diff = ref_losses_w - ref_losses_l
+                                        raw_ref_loss = ref_losses.mean()
+                                        
+                                    scale_term = -0.5 * config.train.beta_dpo
+                                    inside_term = scale_term * (model_diff - ref_diff)
+                                    implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
+                                    loss = -1 * torch.nn.functional.logsigmoid(inside_term).mean()
+                                    
+                                    avg_loss = accelerator.gather(loss.repeat(config.train.total_batch_size)).mean()
+                                    info["avg_loss"].append(avg_loss)
+                                    info["train_loss"].append(avg_loss / int(config.train.total_batch_size / (torch.cuda.device_count())))
+                                    info["avg_model_mse"].append(accelerator.gather(raw_model_loss.repeat(config.train.total_batch_size)).mean())
+                                    info["avg_ref_mse"].append(accelerator.gather(raw_ref_loss.repeat(config.train.total_batch_size)).mean())
+                                    info["avg_acc"].append(accelerator.gather(implicit_acc).mean())
+                                else:
+                                    raise ValueError("Unknown training type")
+                                    
+                            
+                            # backward pass
+                            accelerator.backward(loss)
+                            if accelerator.sync_gradients:
+                                assert j == len(samples_from_buffer) - 1
+                                # log training-related stuff
+                                info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                                info = accelerator.reduce(info, reduction="mean")
+                                info.update({"epoch": epoch, "improve_steps": improve_steps})
+                                accelerator.log(info, step=global_step)
+                                global_step += 1
+                                info = defaultdict(list)
+                                accelerator.clip_grad_norm_(
+                                    unet.parameters(), config.train.max_grad_norm
+                                )
+                            optimizer.step()
+                            optimizer.zero_grad()
                         
-                        # backward pass
-                        accelerator.backward(loss)
-                        if accelerator.sync_gradients:
-                            assert j == len(samples_from_buffer) - 1
-                            # log training-related stuff
-                            info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                            info = accelerator.reduce(info, reduction="mean")
-                            info.update({"epoch": epoch, "improve_steps": improve_steps})
-                            accelerator.log(info, step=global_step)
-                            global_step += 1
-                            info = defaultdict(list)
-                            accelerator.clip_grad_norm_(
-                                unet.parameters(), config.train.max_grad_norm
-                            )
-                        optimizer.step()
-                        optimizer.zero_grad()
-                    
-                        # if accelerator.sync_gradients:
-                            # assert (int(config.train.gradient_steps_per_improve_step / (accelerator.num_processes * config.train.batch_size))) % config.train.gradient_accumulation_steps == 0
+                            # if accelerator.sync_gradients:
+                                # assert (int(config.train.gradient_steps_per_improve_step / (accelerator.num_processes * config.train.batch_size))) % config.train.gradient_accumulation_steps == 0
             
 
             eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(

@@ -13,7 +13,7 @@ def get_config():
     config.logdir = "logs"
     # number of epochs to train for. each epoch is one round of sampling from the model followed by training on those
     # samples.
-    config.num_epochs = 500
+    config.num_epochs = 5000
     # number of epochs between saving model checkpoints.
     config.save_freq = 10
     # number of checkpoints to keep before overwriting old ones.
@@ -62,7 +62,7 @@ def get_config():
     # whether to use the 8bit Adam optimizer from bitsandbytes.
     train.use_8bit_adam = False
     # learning rate.
-    train.learning_rate = 1e-5
+    train.learning_rate = 5e-4
     # Adam beta1.
     train.adam_beta1 = 0.9
     # Adam beta2.
@@ -97,6 +97,7 @@ def get_config():
     # DPO or SFT?
     train.type = 'sft' # dpo or sft
     train.beta_dpo = 5000
+    train.sft_negative_gradient = False
 
     config.data = data = ml_collections.ConfigDict()
     data.resolution = 512

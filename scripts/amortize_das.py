@@ -205,7 +205,7 @@ def main(_):
                 config.resume_from,
                 sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
             )
-
+    accumulation_steps = int(config.train.total_batch_size / (torch.cuda.device_count())) if not config.train.sft_negative_gradient else int(config.train.total_batch_size / (torch.cuda.device_count()))
     accelerator = Accelerator(
         log_with="wandb",
         mixed_precision=config.mixed_precision,
@@ -213,7 +213,7 @@ def main(_):
         # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
         # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
         # the total number of optimizer steps to accumulate across.
-        gradient_accumulation_steps=int(config.train.total_batch_size / (torch.cuda.device_count()))
+        gradient_accumulation_steps=accumulation_steps
     )
     
     if accelerator.is_main_process:
@@ -550,6 +550,7 @@ def main(_):
                 with autocast():
                     prompt_embeds = pipeline.text_encoder(samples["prompt_ids"])[0]
                     positive_latents = pipeline.vae.encode(samples["win_image"].to(inference_dtype)).latent_dist.sample() * pipeline.vae.config.scaling_factor
+                    negative_latents = pipeline.vae.encode(samples["lose_image"].to(inference_dtype)).latent_dist.sample() * pipeline.vae.config.scaling_factor
                     if config.train.type == 'sft':
                         if config.train.cfg:
                             # concat negative prompts to sample prompts to avoid two forward passes
@@ -571,6 +572,7 @@ def main(_):
                                 + config.sample.guidance_scale
                                 * (noise_pred_text - noise_pred_uncond)
                             )
+                        
 
                             if config.train.kl_coef > 0:
                                 with torch.no_grad():
@@ -585,10 +587,12 @@ def main(_):
                                         + config.sample.guidance_scale
                                         * (ref_noise_pred_text - ref_noise_pred_uncond)
                                     )
+
+                            loss = mse_loss(noise_pred, noise)
+
                         else:
                             raise NotImplementedError("Not implemented yet")
-
-                        loss = mse_loss(noise_pred, noise)
+                        
 
                         if config.train.kl_coef > 0:
                             kl_loss = config.train.kl_coef * mse_loss(noise_pred, ref_noise_pred.detach())
@@ -636,25 +640,59 @@ def main(_):
             
             # backward pass
             accelerator.backward(loss)
-            if accelerator.sync_gradients:
-                # assert j == (config.train.total_batch_size // accelerator.num_processes) - 1
-                # log training-related stuff
-                info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                info = accelerator.reduce(info, reduction="mean")
-                info.update({"epoch": epoch})
-                accelerator.log(info, step=global_step)
-                global_step += 1
-                info = defaultdict(list)
-                accelerator.clip_grad_norm_(
-                    unet.parameters(), config.train.max_grad_norm
-                )
+            if not config.train.sft_negative_gradient:
+                if accelerator.sync_gradients:
+                    # assert j == (config.train.total_batch_size // accelerator.num_processes) - 1
+                    # log training-related stuff
+                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                    info = accelerator.reduce(info, reduction="mean")
+                    info.update({"epoch": epoch})
+                    accelerator.log(info, step=global_step)
+                    global_step += 1
+                    info = defaultdict(list)
+                    accelerator.clip_grad_norm_(
+                        unet.parameters(), config.train.max_grad_norm
+                    )
             optimizer.step()
             optimizer.zero_grad()
-        
+            
+            with accelerator.accumulate(unet):
+                with autocast():
+                    if config.train.type == 'sft':
+                        if config.train.cfg:
+                            if config.train.sft_negative_gradient:
+                                clean_negative_latents = negative_latents
+                                noise = torch.randn_like(clean_negative_latents, dtype=torch.float32)
+                                noised_negative_latents = pipeline.scheduler.add_noise(clean_negative_latents, noise, timesteps)
+                                noise_negative_pred = unet(torch.cat([noised_negative_latents] * 2), torch.cat([timesteps] * 2), embeds).sample
+                                noise_negative_pred_uncond, noise_negative_pred_text = noise_negative_pred.chunk(2)
+                                noise_negative_pred = (
+                                    noise_negative_pred_uncond
+                                    + config.sample.guidance_scale
+                                    * (noise_negative_pred_text - noise_negative_pred_uncond)
+                                )
+                                loss = -mse_loss(noise_negative_pred, noise)
+                                accelerator.backward(loss)
+                                if accelerator.sync_gradients:
+                                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                                    info = accelerator.reduce(info, reduction="mean")
+                                    info.update({"epoch": epoch})
+                                    accelerator.log(info, step=global_step)
+                                    global_step += 1
+                                    info = defaultdict(list)
+                                    accelerator.clip_grad_norm_(
+                                        unet.parameters(), config.train.max_grad_norm
+                                    )
+                                optimizer.step()
+                                optimizer.zero_grad()
+                        else:
+                            raise NotImplementedError("Not implemented yet")
+            
+
             # if accelerator.sync_gradients:
                 # assert (int(config.train.gradient_steps_per_improve_step / (accelerator.num_processes * config.train.batch_size))) % config.train.gradient_accumulation_steps == 0
         
-        if epoch % 20 == 0:
+        if epoch % 10 == 0:
             eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(
                 pipeline=pipeline,
                 sample_neg_prompt_embeds=sample_neg_prompt_embeds,

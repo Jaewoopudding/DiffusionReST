@@ -87,7 +87,6 @@ def generate_evaluation_samples(
         
         eval_latents = torch.stack(eval_latents, dim=1)
         eval_log_probs = torch.stack(eval_log_probs)
-
         # reward를 비동기로 계산
         eval_rewards_future = executor.submit(reward_fn, eval_images, prompts_history[i % len(prompts_history)], prompts_metadata_history[i % len(prompts_history)])
         time.sleep(0)  # 비동기 호출이 시작될 시간을 주기 위함
@@ -607,7 +606,6 @@ def main(_):
                 ):
                     with accelerator.accumulate(unet):
                         with autocast():
-                            breakpoint()
                             if config.train.cfg:
                                 noise_pred = unet(torch.cat([sample["latents"][:, j]] * 2),torch.cat([sample["timesteps"][:, j]] * 2),embeds,).sample
                                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -634,7 +632,7 @@ def main(_):
 
                         # ppo logic
                         advantages = torch.clamp(
-                            sample["advantages"],
+                            torch.exp(sample["advantages"]),
                             -config.train.adv_clip_max,
                             config.train.adv_clip_max,
                         )

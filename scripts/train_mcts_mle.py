@@ -615,6 +615,7 @@ def main(_):
         )
         
         samples['eval_latents'] = eval_samples['latents']
+        samples['eval_next_latents'] = eval_samples['next_latents']
 
         if epoch == 0:
             for i, image in enumerate(eval_images_list):
@@ -704,7 +705,7 @@ def main(_):
             mse_loss = torch.nn.MSELoss()
             info = defaultdict(list)
             
-            if config.tree_amortization:        
+            if config.tree_amortization == 'offline_RL':        
                 for i, sample in tqdm(
                     list(enumerate(samples_batched)),
                     desc=f"Epoch {epoch}.{improve_steps}: training",
@@ -728,7 +729,6 @@ def main(_):
                                 current_nodes = search_tree.root_nodes
                                 latents = current_nodes.states
                                 timesteps = current_nodes.timesteps
-                                print(timesteps)
                                 
                                 noise_pred = unet(torch.cat([latents] * 2),torch.cat([timesteps] * 2),embeds,).sample
                                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -739,7 +739,7 @@ def main(_):
                                 )
                                 
                                 child_rewards = torch.tensor([child.reward for child in current_nodes.get_children()[0]], dtype=torch.float32, device=accelerator.device).view(-1, 1)
-                                advantages = ((child_rewards - child_rewards.mean()) / (child_rewards.std() + 1e-8))
+                                advantages = torch.exp((child_rewards - child_rewards.mean()) / (child_rewards.std() + 1e-8))
                             advantages = torch.clamp(advantages,-config.train.adv_clip_max, config.train.adv_clip_max )
                             for idx, child in enumerate(current_nodes.get_children()[0]):
                                 _, log_prob = ddim_step_with_logprob(
@@ -750,7 +750,7 @@ def main(_):
                                     eta=config.sample.eta,
                                     prev_sample=child.state
                                 )
-                                loss = advantages[idx] * log_prob
+                                loss = - advantages[idx] * log_prob
                                 info['loss'].append(loss)
                                 
                                 if idx ==  len(current_nodes.get_children()[0]) - 1:
@@ -769,8 +769,66 @@ def main(_):
                                     )
                                 optimizer.step()
                                 optimizer.zero_grad()
-                    
             
+            elif config.tree_amortization == 'dpo':
+                for i, sample in tqdm(
+                    list(enumerate(samples_batched)),
+                    desc=f"Epoch {epoch}.{improve_steps}: training",
+                    position=0,
+                    disable=not accelerator.is_local_main_process,
+                ):
+                    embeds = torch.cat([train_neg_prompt_embeds, sample["prompt_embeds"]])
+                    
+                    for j in tqdm(
+                        range(num_train_timesteps),
+                        desc="Timestep",
+                        position=1,
+                        leave=False,
+                        disable=not accelerator.is_local_main_process,
+                    ):
+                        with accelerator.accumulate(unet):
+                            with autocast():
+                                latents = sample['latents'][:, j]
+                                timesteps = sample['timesteps'][:, j]
+                                next_latents = sample['next_latents'][:, j]
+                                
+                                breakpoint()
+                                noise_pred = unet(torch.cat([latents] * 2),torch.cat([timesteps] * 2), embeds,).sample
+                                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                                noise_pred = (
+                                    noise_pred_uncond
+                                    + config.sample.guidance_scale
+                                    * (noise_pred_text - noise_pred_uncond)
+                                )
+                                _, search_log_prob = ddim_step_with_logprob(
+                                    pipeline.scheduler,
+                                    noise_pred,
+                                    timesteps.to(torch.int64),
+                                    latents,
+                                    eta=config.sample.eta,
+                                    prev_sample=next_latents
+                                )
+                                
+                                latents = sample['eval_latents'][:, j]
+                                next_latents = sample['eval_next_latents'][:, j]
+                                breakpoint()
+                                neg_noise_pred = unet(torch.cat([latents] * 2), torch.cat([timesteps] * 2), embeds,).sample
+                                neg_noise_pred_uncond, neg_noise_pred_text = neg_noise_pred.chunk(2)
+                                neg_noise_pred = (
+                                    neg_noise_pred_uncond
+                                    + config.sample.guidance_scale
+                                    * (neg_noise_pred_text - neg_noise_pred_uncond)
+                                )
+                                _, neg_log_prob = ddim_step_with_logprob(
+                                    pipeline.scheduler,
+                                    neg_noise_pred,
+                                    timesteps.to(torch.int64),
+                                    latents,
+                                    eta=config.sample.eta,
+                                    prev_sample=next_latents,
+                                )         
+                            loss = torch.nn.functional.binary_cross_entropy_with_logits(config.train.beta * (search_log_prob - neg_log_prob)).mean()                  
+                                
             else:
                 for step in tqdm(
                     range(config.train.gradient_steps_per_improve_step),

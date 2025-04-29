@@ -76,19 +76,16 @@ def clip_score(
 
 
 def aesthetic_score_diff(
-                     torch_dtype=None):
+                     torch_dtype=torch.float32):
     from ddpo_pytorch.aesthetic_scorer import AestheticScorerDiff
     
-    target_size = 224
-    normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                                std=[0.26862954, 0.26130258, 0.27577711])
     scorer = AestheticScorerDiff(dtype=torch_dtype).to(dtype=torch_dtype)
     scorer.requires_grad_(False)
-    target_size = 224
-    def loss_fn(im_pix_un, prompts=None, metadata=None):
-        im_pix = ((im_pix_un / 2) + 0.5).clamp(0, 1) 
-        im_pix = torchvision.transforms.Resize(target_size)(im_pix)
-        im_pix = normalize(im_pix).to(im_pix_un.dtype)
+    
+    def loss_fn(im_pix, prompts=None, metadata=None):
+        if im_pix.min() < 0:
+            im_pix = ((im_pix / 2) + 0.5).clamp(0, 1) 
+        im_pix = im_pix.to(torch_dtype)
         scorer_ = scorer.to(im_pix.device)
         rewards = scorer_(im_pix)
         return rewards, rewards

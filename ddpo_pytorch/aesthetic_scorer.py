@@ -6,6 +6,7 @@ import torch.nn as nn
 import numpy as np
 from transformers import CLIPModel, CLIPProcessor
 from PIL import Image
+import torchvision
 
 ASSETS_PATH = resources.files("ddpo_pytorch.assets")
 
@@ -78,6 +79,8 @@ class MLPDiff(nn.Module):
         return embed
 
 
+
+
 class AestheticScorerDiff(torch.nn.Module):
     def __init__(self, dtype):
         super().__init__()
@@ -87,16 +90,28 @@ class AestheticScorerDiff(torch.nn.Module):
         self.mlp.load_state_dict(state_dict)
         self.dtype = dtype
         self.eval()
+        self.target_size =  224
+        self.normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                                    std=[0.26862954, 0.26130258, 0.27577711])
+
 
     def __call__(self, images):
-        device = next(self.parameters()).device
-        embed = self.clip.get_image_features(pixel_values=images.to(self.dtype).to(device))
+        inputs = torchvision.transforms.Resize(self.target_size)(images)
+        inputs = self.normalize(inputs).to(self.dtype)
+        embed = self.clip.get_image_features(pixel_values=inputs)
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
+
+
+        # device = next(self.parameters()).device
+        # embed = self.clip.get_image_features(pixel_values=images.to(self.dtype).to(device))
+        # embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         return self.mlp(embed).squeeze(1)
 
     
     def generate_feats(self, images):
         device = next(self.parameters()).device
         embed = self.clip.get_image_features(pixel_values=images.to(self.dtype).to(device))
-        embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
+        norm = torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
+        norm = norm.clamp(min=1e-6) 
+        embed = embed / norm
         return embed

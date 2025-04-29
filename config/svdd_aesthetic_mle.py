@@ -111,7 +111,7 @@ def get_config():
     # reward function to use. see `rewards.py` for available reward functions.
     config.reward_fn = "aesthetic_score" # aesthetic_score jpeg_compressibility
     config.eval_fn = "multi_reward_evaluation"
-    config.tree_amortization = 'offline_RL'
+    config.multistep_mdp = True
 
     ###### Per-Prompt Stat Tracking ######
     # when enabled, the model will track the mean and std of reward on a per-prompt basis and use that to compute
@@ -133,7 +133,7 @@ def get_config():
     search.progressive_widening = False
     search.pw_alpha = 0.0
     search.value_gradient = False
-    search.kl_lagrangian_coef = 0.0005
+    search.kl_lagrangian_coef = 0.005
     search.tempering_gamma = 0.008
     search.jump_policy = False
 

@@ -16,6 +16,7 @@ class Node:
         self.value = 0
         self.best_reward = None
         self.log_prob = log_prob
+        self.gradient = None
         
     def get_parent(self):
         return self.parent
@@ -311,7 +312,7 @@ class TreePolicy:
                 new_timesteps, 
                 torch.zeros_like(new_timesteps, device=new_timesteps.device) 
             ).repeat_interleave(duplicate).view(1, duplicate)
-            nodes.add_children(new_latents, new_timesteps, log_probs.view(1, duplicate))
+            nodes.add_children(new_latents.detach(), new_timesteps, log_probs.view(1, duplicate).detach().cpu())
 
             for idx, nodes in enumerate(tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=2, disable=True)):
                 self.evaluate(BatchedNode(nodes), jump_latents[idx], jump_timesteps)
@@ -351,7 +352,6 @@ class TreePolicy:
         image = self.pipeline.vae.decode(pred_original_sample.to(self.pipeline.vae.dtype) / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
         do_denormalize = [True] * image.shape[0]
         image = self.pipeline.image_processor.postprocess(image, output_type="pt", do_denormalize=do_denormalize)
-
         evaluation, _ = self.reward_fn(image, self.prompt, self.prompt_metadata)
         batched_nodes.rewards = evaluation
         return evaluation

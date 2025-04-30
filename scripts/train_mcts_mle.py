@@ -184,8 +184,6 @@ def main(_):
             accumulation_steps = num_train_timesteps
     else:
         accumulation_steps = int(config.train.total_batch_size / (torch.cuda.device_count()))
-
-    accumulation_steps = num_train_timesteps * 2 if config.train.type == 'energy_based_negative_gradient' else num_train_timesteps
     accelerator = Accelerator(
         log_with="wandb",
         mixed_precision=config.mixed_precision,
@@ -816,22 +814,16 @@ def main(_):
                                     )
                                     
                                 loss = -search_log_prob
-                                accelerator.backward(loss)
                                 info["positive_loss"].append(loss.mean())
-                                info["positive_logprobs"].append(search_log_prob.mean())
-                                if accelerator.sync_gradients:
-                                    # log training-related stuff
-                                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                                    info = accelerator.reduce(info, reduction="mean")
-                                    info.update({"epoch": epoch, "improve_steps": improve_steps})
-                                    accelerator.log(info, step=global_step)
-                                    global_step += 1
-                                    info = defaultdict(list)
-                                    accelerator.clip_grad_norm_(
-                                        unet.parameters(), config.train.max_grad_norm
-                                    )
-                                optimizer.step()
-                                optimizer.zero_grad()
+                                accelerator.backward(loss)
+                                # if accelerator.sync_gradients:
+                                #     info = defaultdict(list)
+                                #     accelerator.clip_grad_norm_(
+                                #         unet.parameters(), config.train.max_grad_norm
+                                #     )
+                                # info["positive_loss"].append(loss.mean())
+                                # optimizer.step()
+                                # optimizer.zero_grad()
                                     
                                 # with autocast():
                                 #     latents = sample['eval_latents'][:, j]
@@ -855,19 +847,19 @@ def main(_):
                                 # info["negative_loss"].append(loss)
                                 # info["negative_logprobs"].append(neg_log_prob.mean())
                                 # accelerator.backward(loss)
-                                # if accelerator.sync_gradients:
-                                #     # log training-related stuff
-                                #     info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                                #     info = accelerator.reduce(info, reduction="mean")
-                                #     info.update({"epoch": epoch, "improve_steps": improve_steps})
-                                #     accelerator.log(info, step=global_step)
-                                #     global_step += 1
-                                #     info = defaultdict(list)
-                                #     accelerator.clip_grad_norm_(
-                                #         unet.parameters(), config.train.max_grad_norm
-                                #     )
-                                # optimizer.step()
-                                # optimizer.zero_grad()
+                                if accelerator.sync_gradients:
+                                    # log training-related stuff
+                                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                                    info = accelerator.reduce(info, reduction="mean")
+                                    info.update({"epoch": epoch, "improve_steps": improve_steps})
+                                    accelerator.log(info, step=global_step)
+                                    global_step += 1
+                                    info = defaultdict(list)
+                                    accelerator.clip_grad_norm_(
+                                        unet.parameters(), config.train.max_grad_norm
+                                    )
+                                optimizer.step()
+                                optimizer.zero_grad()
                                 
                 elif config.train.type == 'dpo':
                     for i, sample in tqdm(

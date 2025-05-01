@@ -312,7 +312,7 @@ class TreePolicy:
                 new_timesteps, 
                 torch.zeros_like(new_timesteps, device=new_timesteps.device) 
             ).repeat_interleave(duplicate).view(1, duplicate)
-            nodes.add_children(new_latents.detach(), new_timesteps, log_probs.view(1, duplicate).detach().cpu())
+            nodes.add_children(new_latents.detach(), new_timesteps, log_probs.view(1, duplicate).detach())
 
             for idx, nodes in enumerate(tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=2, disable=True)):
                 self.evaluate(BatchedNode(nodes), jump_latents[idx], jump_timesteps)

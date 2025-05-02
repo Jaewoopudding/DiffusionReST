@@ -97,6 +97,7 @@ def get_config():
     # DPO or SFT?
     train.type = 'sft' # dpo or sft
     train.beta_dpo = 5000
+    train.negative_gradient = False
     
     config.eval = eval = ml_collections.ConfigDict()
     eval.num_images_per_prompt = 8

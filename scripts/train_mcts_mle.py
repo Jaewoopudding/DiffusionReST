@@ -179,7 +179,11 @@ def main(_):
 
     if config.multistep_mdp:
         if config.train.type == 'energy_based_negative_gradient':
-            accumulation_steps = num_train_timesteps * 2
+            accumulation_steps = num_train_timesteps
+            if config.train.kl_coef > 0:
+                accumulation_steps += num_train_timesteps
+            if config.train.negative_gradient:
+                accumulation_steps += num_train_timesteps
         else:
             accumulation_steps = num_train_timesteps
     else:
@@ -817,48 +821,10 @@ def main(_):
                                 loss = -search_log_prob
                                 info["positive_loss"].append(loss)
                                 accelerator.backward(loss)
-                                optimizer.step()
-                                optimizer.zero_grad()
-                                
-                            with accelerator.accumulate(unet):
-                                with autocast():
-                                    latents = sample['eval_latents'][:, j]
-                                    next_latents = sample['eval_next_latents'][:, j]
-                                    neg_noise_pred = unet(torch.cat([latents] * 2), torch.cat([timesteps] * 2), embeds,).sample
-                                    neg_noise_pred_uncond, neg_noise_pred_text = neg_noise_pred.chunk(2)
-                                    neg_noise_pred = (
-                                        neg_noise_pred_uncond
-                                        + config.sample.guidance_scale
-                                        * (neg_noise_pred_text - neg_noise_pred_uncond)
-                                    )
-                                    _, neg_log_prob = ddim_step_with_logprob(
-                                        pipeline.scheduler,
-                                        neg_noise_pred,
-                                        timesteps.to(torch.int64),
-                                        latents,
-                                        eta=config.sample.eta,
-                                        prev_sample=next_latents,
-                                    )         
-
-                                neg_prob_ref = sample['eval_log_probs'][:, j]
-                                neg_prob_threshold = neg_prob_ref * (1 - torch.sign(neg_prob_ref) * config.train.clip_range)
-                                loss = torch.clip(neg_log_prob, min=neg_prob_threshold)
-                                info["negative_loss"].append(loss)                                
-                                info["clipfrac"].append(
-                                    torch.mean(
-                                        (
-                                            neg_log_prob < neg_prob_threshold
-                                        ).float().view(-1, 1)
-                                    )
-                                )
-                                
-                                accelerator.backward(loss)
-                                if accelerator.sync_gradients:
-                                    # log training-related stuff
+                                if (config.train.kl_coef) == 0 and (not config.train.negative_gradient) and (accelerator.sync_gradients):
                                     info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
                                     info = accelerator.reduce(info, reduction="mean")
                                     info.update({"epoch": epoch, "improve_steps": improve_steps})
-                                    
                                     accelerator.log(info, step=global_step)
                                     global_step += 1
                                     info = defaultdict(list)
@@ -867,6 +833,97 @@ def main(_):
                                     )
                                 optimizer.step()
                                 optimizer.zero_grad()
+
+                            if config.train.kl_coef > 0:
+                                with accelerator.accumulate(unet):
+                                    with autocast():
+                                        noise_pred = unet(
+                                            torch.cat([latents] * 2),
+                                            torch.cat([timesteps] * 2), 
+                                            embeds,
+                                        ).sample
+                                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                                        noise_pred = (
+                                            noise_pred_uncond
+                                            + config.sample.guidance_scale
+                                            * (noise_pred_text - noise_pred_uncond)
+                                        )
+                                        with torch.no_grad():
+                                            ref_noise_pred = unet_pretrained(
+                                                torch.cat([latents] * 2),
+                                                torch.cat([timesteps] * 2),
+                                                embeds,
+                                            ).sample
+                                            ref_noise_pred_uncond, ref_noise_pred_text = ref_noise_pred.chunk(2)
+                                            ref_noise_pred = (
+                                                ref_noise_pred_uncond
+                                                + config.sample.guidance_scale
+                                                * (ref_noise_pred_text - ref_noise_pred_uncond)
+                                            )
+                                    kl_loss = config.train.kl_coef * mse_loss(noise_pred, ref_noise_pred.detach())
+                                    info["kl_loss"].append(kl_loss)
+                                    accelerator.backward(kl_loss)
+                                    if (not config.train.negative_gradient) and (accelerator.sync_gradients):
+                                        info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                                        info = accelerator.reduce(info, reduction="mean")
+                                        info.update({"epoch": epoch, "improve_steps": improve_steps})
+                                        accelerator.log(info, step=global_step)
+                                        global_step += 1
+                                        info = defaultdict(list)
+                                        accelerator.clip_grad_norm_(
+                                            unet.parameters(), config.train.max_grad_norm
+                                        )
+                                    optimizer.step()
+                                    optimizer.zero_grad()
+                                    
+                            if config.train.negative_gradient:
+                                with accelerator.accumulate(unet):
+                                    with autocast():
+                                        latents = sample['eval_latents'][:, j]
+                                        next_latents = sample['eval_next_latents'][:, j]
+                                        neg_noise_pred = unet(torch.cat([latents] * 2), torch.cat([timesteps] * 2), embeds,).sample
+                                        neg_noise_pred_uncond, neg_noise_pred_text = neg_noise_pred.chunk(2)
+                                        neg_noise_pred = (
+                                            neg_noise_pred_uncond
+                                            + config.sample.guidance_scale
+                                            * (neg_noise_pred_text - neg_noise_pred_uncond)
+                                        )
+                                        _, neg_log_prob = ddim_step_with_logprob(
+                                            pipeline.scheduler,
+                                            neg_noise_pred,
+                                            timesteps.to(torch.int64),
+                                            latents,
+                                            eta=config.sample.eta,
+                                            prev_sample=next_latents,
+                                        )         
+
+                                    neg_prob_ref = sample['eval_log_probs'][:, j]
+                                    neg_prob_threshold = neg_prob_ref * (1 - torch.sign(neg_prob_ref) * config.train.clip_range)
+                                    loss = torch.clip(neg_log_prob, min=neg_prob_threshold)
+                                    info["negative_loss"].append(loss)                                
+                                    info["clipfrac"].append(
+                                        torch.mean(
+                                            (
+                                                neg_log_prob < neg_prob_threshold
+                                            ).float().view(-1, 1)
+                                        )
+                                    )
+                                    
+                                    accelerator.backward(loss)
+                                    if accelerator.sync_gradients:
+                                        # log training-related stuff
+                                        info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                                        info = accelerator.reduce(info, reduction="mean")
+                                        info.update({"epoch": epoch, "improve_steps": improve_steps})
+                                        
+                                        accelerator.log(info, step=global_step)
+                                        global_step += 1
+                                        info = defaultdict(list)
+                                        accelerator.clip_grad_norm_(
+                                            unet.parameters(), config.train.max_grad_norm
+                                        )
+                                    optimizer.step()
+                                    optimizer.zero_grad()
                                 
                 elif config.train.type == 'dpo':
                     for i, sample in tqdm(

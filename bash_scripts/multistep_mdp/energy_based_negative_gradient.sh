@@ -10,10 +10,11 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --main_process_port 29503 scripts
 --config.train.improve_steps 1 \
 --config.sample.num_batches_per_epoch 32 \
 --config.prompt_fn simple_animals \
---config.train.kl_coef 0.00 \
+--config.train.kl_coef 0.01 \
 --config.train.type 'energy_based_negative_gradient' \
 --config.eval.num_images_per_prompt 1 \
 --config.sample.num_prompts_per_batch 32 \
 --config.search.value_gradient \
 --config.reward_fn aesthetic_score_diff \
 --config.search.kl_lagrangian_coef 0.005 \
+--config.train.negative_gradient True \ 

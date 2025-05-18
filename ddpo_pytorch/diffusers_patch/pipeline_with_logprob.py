@@ -285,6 +285,7 @@ def tree_pipeline_with_logprob(
     guidance_rescale: float = 0.0,
     prompt_metadata: Optional[Dict[str, Any]] = None,
     prompts: Optional[List[str]] = None,
+    ref_unet: Callable = None,
 ):
     r"""
     Function invoked when calling the pipeline for generation.
@@ -441,9 +442,11 @@ def tree_pipeline_with_logprob(
         config=config,
         reward_fn=reward_fn,
         prompt=prompts,
-        prompt_metadata=prompt_metadata
+        prompt_metadata=prompt_metadata,
+        ref_unet=ref_unet,
+        gamma=config.search.gamma
     ) 
-    prior = tree.select(tree.UCT).states
+    prior = tree.select(tree.importance_sampling).states
     all_latents = []
     all_log_probs = []
     
@@ -452,9 +455,9 @@ def tree_pipeline_with_logprob(
     with self.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(tqdm(timesteps, position=2, desc="Timesteps", leave=False, disable=True)):
             for _ in tqdm(range(config.search.nfe_per_action), position=3, desc="NFE Budget", leave=False, disable=True):
-                current_nodes = tree.select(select_fn=tree.UCT)
-                tree.expand(nodes=current_nodes, use_gradient=config.search.value_gradient, jump=config.search.jump_policy)    
-            tree.act_and_prune(select_fn=tree.max_value, prune=False)  
+                current_nodes = tree.select(select_fn=tree.importance_sampling)
+                tree.expand(nodes=current_nodes, use_gradient=config.search.value_gradient, jump=False)    
+            tree.act_and_prune(select_fn=tree.argmax_value, prune=False)  
             latents = tree.root_nodes.states
             
             all_latents.append(latents)

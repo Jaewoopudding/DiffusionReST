@@ -45,6 +45,25 @@ def aesthetic_score(dtype = torch.float32):
 
     return _fn
 
+def aesthetic_score_diff(torch_dtype=torch.float32):
+    from ddpo_pytorch.aesthetic_scorer import AestheticScorerDiff
+    
+    scorer = AestheticScorerDiff(dtype=torch_dtype).to(dtype=torch_dtype)
+    scorer.requires_grad_(False)
+    
+    def loss_fn(im_pix, prompts=None, metadata=None):
+        if im_pix.min() < 0:
+            im_pix = ((im_pix / 2) + 0.5).clamp(0, 1) 
+        im_pix = im_pix.to(torch_dtype)
+        scorer_ = scorer.to(im_pix.device)
+        rewards = scorer_(im_pix)
+        return rewards, rewards
+    return loss_fn
+
+
+
+
+
 
 def clip_score(
     return_loss=False, 
@@ -75,21 +94,6 @@ def clip_score(
         return loss_fn
 
 
-def aesthetic_score_diff(
-                     torch_dtype=torch.float32):
-    from ddpo_pytorch.aesthetic_scorer import AestheticScorerDiff
-    
-    scorer = AestheticScorerDiff(dtype=torch_dtype).to(dtype=torch_dtype)
-    scorer.requires_grad_(False)
-    
-    def loss_fn(im_pix, prompts=None, metadata=None):
-        if im_pix.min() < 0:
-            im_pix = ((im_pix / 2) + 0.5).clamp(0, 1) 
-        im_pix = im_pix.to(torch_dtype)
-        scorer_ = scorer.to(im_pix.device)
-        rewards = scorer_(im_pix)
-        return rewards, rewards
-    return loss_fn
 
 
 

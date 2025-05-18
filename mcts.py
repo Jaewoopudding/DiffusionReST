@@ -2,10 +2,11 @@ import torch, torchvision
 import numpy as np
 from tqdm import tqdm
 from ddpo_pytorch.diffusers_patch.ddim_with_kl import predict_x0_from_xt_MCTS, ddim_step_KL_MCTS
+from ddpo_pytorch.diffusers_patch.ddim_with_logprob import ddim_step_with_logprob
 tqdm.tqdm = lambda *args, **kwargs: args[0]
 
 class Node:
-    def __init__(self, state, reward, timestep, log_prob=None, parent=None):
+    def __init__(self, state, reward, timestep, log_prob=0, ref_log_prob=0, parent=None):
         self.state = state
         self.parent = parent
         self.children = []
@@ -16,6 +17,7 @@ class Node:
         self.value = 0
         self.best_reward = None
         self.log_prob = log_prob
+        self.ref_log_prob = ref_log_prob
         self.gradient = None
         
     def get_parent(self):
@@ -24,13 +26,19 @@ class Node:
     def get_children(self):
         return self.children
         
-    def add_children(self, states, timesteps, log_probs=None):
-        if log_probs is None:
+    def add_children(self, states, timesteps, log_probs=None, ref_log_probs=None):
+        if log_probs is None and ref_log_probs is None:
             for state, timestep in zip(states, timesteps):
-                self.children.append(Node(state=state, reward=None, timestep=timestep, log_prob=None, parent=self))
-        else:
+                self.children.append(Node(state=state, reward=None, timestep=timestep, log_prob=None, ref_log_prob=None, parent=self))
+        elif log_probs is not None and ref_log_probs is None:
             for state, timestep, log_prob in zip(states, timesteps, log_probs):
-                self.children.append(Node(state=state, reward=None, timestep=timestep, log_prob=log_prob, parent=self))
+                self.children.append(Node(state=state, reward=None, timestep=timestep, log_prob=log_prob, ref_log_prob=None, parent=self))
+        elif log_probs is None and ref_log_probs is not None:
+            for state, timestep, ref_log_prob in zip(states, timesteps, ref_log_probs):
+                self.children.append(Node(state=state, reward=None, timestep=timestep, log_prob=None, ref_log_prob=ref_log_prob, parent=self))
+        else:
+            for state, timestep, log_prob, ref_log_prob in zip(states, timesteps, log_probs, ref_log_probs):
+                self.children.append(Node(state=state, reward=None, timestep=timestep, log_prob=log_prob, ref_log_prob=ref_log_prob, parent=self))
             
     def set_value(self, value):
         self.value = value
@@ -126,11 +134,15 @@ class BatchedNode:
             result.append(novel_children)
         return result
             
-    def add_children(self, children_states_list, children_timesteps_list, children_log_probs_list=None):
-        if children_log_probs_list is None:
+    def add_children(self, children_states_list, children_timesteps_list, children_log_probs_list=None, children_ref_log_probs_list=None):
+        if children_log_probs_list is None and children_ref_log_probs_list is None:
             [node.add_children(states, ts) for node, states, ts in zip(self.node_list, children_states_list, children_timesteps_list)]
-        else:   
+        elif children_log_probs_list is not None and children_ref_log_probs_list is None:
             [node.add_children(states, ts, log_probs) for node, states, ts, log_probs in zip(self.node_list, children_states_list, children_timesteps_list, children_log_probs_list)]
+        elif children_log_probs_list is None and children_ref_log_probs_list is not None:
+            [node.add_children(states, ts, ref_log_probs=ref_log_probs) for node, states, ts, ref_log_probs in zip(self.node_list, children_states_list, children_timesteps_list, children_ref_log_probs_list)]
+        else:   
+            [node.add_children(states, ts, log_probs, ref_log_probs) for node, states, ts, log_probs, ref_log_probs in zip(self.node_list, children_states_list, children_timesteps_list, children_log_probs_list, children_ref_log_probs_list)]
         
     def __call__(self):
         return self.node_list 
@@ -152,7 +164,9 @@ class TreePolicy:
             guidance_scale=1.0,
             eta=1.0,
             prompt=None,
-            prompt_metadata=None
+            prompt_metadata=None,
+            ref_unet=None,
+            gamma=0.93
         ):
         self.prompt_embeds = prompt_embeds
         self.cross_attention_kwargs = cross_attention_kwargs
@@ -178,7 +192,10 @@ class TreePolicy:
         self.prompt = prompt
         self.prompt_metadata = prompt_metadata
         
+        self.ref_unet = ref_unet
+        self.gamma = gamma
         
+        self.base_unet = pipeline.unet if config.search.hill_climbing else ref_unet
         
         # initial node for x_T starting point
         self.root_nodes = BatchedNode(node_list)
@@ -211,8 +228,12 @@ class TreePolicy:
                 parent_visits_tensor = torch.tensor(current.visit_count, dtype=torch.float32, device=self.device)
                 child_values = torch.tensor([child.value for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
                 child_visits = torch.tensor([child.visit_count for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
-                
-                best_idx = select_fn(parent_visits_tensor, child_values, child_visits)
+                child_rewards = torch.tensor([child.reward for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
+                child_log_likelihood = torch.tensor([child.log_prob if child.log_prob is not None else 0 for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
+                child_ref_log_likelihood = torch.tensor([child.ref_log_prob if child.log_prob is not None else 0  for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
+                current_timesteps = torch.as_tensor(current.timestep if current.timestep is not None else self.pipeline.scheduler.config.num_train_timesteps).to(self.device, dtype=torch.float32)            
+                    
+                best_idx =  select_fn(parent_visits_tensor, child_values, child_visits, child_rewards, child_log_likelihood, child_ref_log_likelihood, current_timesteps)
                 best_child = current.get_children()[best_idx]
                 
                 current = best_child
@@ -249,7 +270,7 @@ class TreePolicy:
             latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, timesteps).to(self.pipeline.unet.dtype)
 
             
-            noise_pred = self.pipeline.unet(
+            noise_pred = self.base_unet(
                 latent_model_input,
                 timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else timesteps,
                 encoder_hidden_states=self.prompt_embeds,
@@ -264,22 +285,21 @@ class TreePolicy:
                 
             # ddim_step_KL_modified: 노드의 상태에서 새로운 latent 후보들을 생성
             # new_latents: (B * duplicate, C, H, W)
-            
-            if jump is not None:
+            if jump:
                 jump_step = timesteps / 2
                 jump_timesteps = torch.clamp(timesteps - jump_step, min=0)
 
-
+            model_output = noise_pred
             new_latents, jump_latents, pred_original_sample, variance_coeff, jump_variance_coeff, _, _, log_probs = ddim_step_KL_MCTS( ## TODO 입력 noise_pred 확인
                 self.pipeline.scheduler,
-                noise_pred,    # 예측된 노이즈
+                model_output,    # 예측된 노이즈
                 old_noise_pred,
                 timesteps,
                 latent,
                 eta=self.eta,
                 duplicate=duplicate,
                 jump_step=jump_step,
-            ) # (B * duplicate, C, H, W)
+            ) # (B * duplicate, C, H, W)  
             
             new_latents = new_latents.view(self.pipeline.batch_size, duplicate, *new_latents.shape[1:])
             
@@ -295,15 +315,19 @@ class TreePolicy:
                 if torch.isnan(guidance).any():
                     guidance = torch.nan_to_num(guidance, nan=0)
                     evaluation = torch.nan_to_num(evaluation, nan=-1e6)
+                latent = latent.detach()
                 
-                min_scale = torch.tensor([min((1 + self.tempering_gamma) ** (((self.pipeline.scheduler.timesteps[0] - timesteps) // step_offset) + 1) - 1, 1.)] * timesteps.shape[0], device=self.device)
-                min_scale_next = torch.tensor([min((1 + self.tempering_gamma) ** (((self.pipeline.scheduler.timesteps[0] - timesteps) // step_offset) + 2) - 1, 1.)] * timesteps.shape[0], device=self.device)
+                discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - nodes.timesteps) // step_offset - 1)
+                # min_scale = torch.tensor([min((1 + self.tempering_gamma) ** (((self.pipeline.scheduler.timesteps[0] - timesteps) // step_offset) + 1) - 1, 1.)] * timesteps.shape[0], device=self.device)
+                # min_scale_next = torch.tensor([min((1 + self.tempering_gamma) ** (((self.pipeline.scheduler.timesteps[0] - timesteps) // step_offset) + 2) - 1, 1.)] * timesteps.shape[0], device=self.device)
                 
-                new_latents = new_latents + variance_coeff * guidance * min_scale_next.view(-1, 1, 1, 1)
-                if jump is not None:
-                    jump_latents = jump_latents + jump_variance_coeff * guidance * min_scale.view(-1, 1, 1, 1)
-                    
-            if jump is None:
+                
+                new_latents = new_latents + variance_coeff * guidance * discount.view(-1, 1, 1, 1)
+                if jump:
+                    jump_latents = jump_latents + jump_variance_coeff * guidance * discount.view(-1, 1, 1, 1)
+                model_output = noise_pred + variance_coeff * guidance * discount.view(-1, 1, 1, 1)
+
+            if jump:
                 jump_latents = [None] * duplicate
             new_timesteps = timesteps - step_offset
             mask = new_timesteps >= 0
@@ -312,11 +336,44 @@ class TreePolicy:
                 new_timesteps, 
                 torch.zeros_like(new_timesteps, device=new_timesteps.device) 
             ).repeat_interleave(duplicate).view(1, duplicate)
-            nodes.add_children(new_latents.detach(), new_timesteps, log_probs.view(1, duplicate).detach())
+
+            if self.ref_unet is not None:
+                ref_noise_pred = self.ref_unet(
+                    latent_model_input,
+                    timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else timesteps,
+                    encoder_hidden_states=self.prompt_embeds,
+                    cross_attention_kwargs=self.cross_attention_kwargs,
+                ).sample
+                ref_noise_pred = ref_noise_pred.detach()
+                model_output = ref_noise_pred
+            
+                if self.do_classifier_free_guidance:
+                    ref_noise_pred_uncond, ref_noise_pred_text = ref_noise_pred.chunk(2, dim=0)
+                    ref_old_noise_pred = ref_noise_pred_uncond + self.guidance_scale * (ref_noise_pred_text - ref_noise_pred_uncond)
+                    model_output = ref_old_noise_pred
+
+                _, ref_log_probs = ddim_step_with_logprob(
+                    self=self.pipeline.scheduler,
+                    model_output=model_output,
+                    timestep=timesteps.to(torch.int64),
+                    sample=latent.repeat_interleave(duplicate, dim=0),
+                    eta=self.eta,
+                    prev_sample=new_latents.squeeze(0)
+                )
+                ref_log_probs = ref_log_probs.detach()
+
+                nodes.add_children(new_latents.detach(), new_timesteps, log_probs.view(1, duplicate).detach(), ref_log_probs.view(1, duplicate).detach())
+                del ref_noise_pred, ref_log_probs
+            else:
+                nodes.add_children(new_latents.detach(), new_timesteps, log_probs.view(1, duplicate).detach())
 
             for idx, nodes in enumerate(tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=2, disable=True)):
-                self.evaluate(BatchedNode(nodes), jump_latents[idx], jump_timesteps)
+                self.evaluate(BatchedNode(nodes))
                 self.backpropagate(nodes)
+
+        del latent, old_noise_pred, model_output, noise_pred
+        torch.cuda.empty_cache()
+    
     
     @torch.no_grad()
     def evaluate(self, batched_nodes, jump_latents=None, jump_timesteps=None):
@@ -334,7 +391,7 @@ class TreePolicy:
         latent_model_input = latent_model_input.to(self.pipeline.unet.dtype)
         timesteps = timesteps.to(self.pipeline.unet.dtype)
         
-        noise_pred = self.pipeline.unet(
+        noise_pred = self.ref_unet(
             latent_model_input, 
             timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else timesteps, 
             encoder_hidden_states= self.prompt_embeds, 
@@ -349,6 +406,8 @@ class TreePolicy:
                             states
         )
         
+        # if timesteps == 1:
+        #     breakpoint()
         image = self.pipeline.vae.decode(pred_original_sample.to(self.pipeline.vae.dtype) / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
         do_denormalize = [True] * image.shape[0]
         image = self.pipeline.image_processor.postprocess(image, output_type="pt", do_denormalize=do_denormalize)
@@ -386,8 +445,12 @@ class TreePolicy:
                 parent_visits_tensor = torch.tensor(current.visit_count, dtype=torch.float32, device=self.device)
                 child_values = torch.tensor([child.value for child in children], dtype=torch.float32, device=self.device).squeeze()
                 child_visits = torch.tensor([child.visit_count for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
+                child_rewards = torch.tensor([current.reward for current in children], dtype=torch.float32, device=self.device).squeeze()
+                child_log_likelihood = torch.tensor([child.log_prob if child.log_prob is not None else 0 for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
+                child_ref_log_likelihood = torch.tensor([child.ref_log_prob if child.log_prob is not None else 0  for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
+                current_timesteps = torch.as_tensor(current.timestep if current.timestep is not None else self.pipeline.scheduler.config.num_train_timesteps).to(self.device, dtype=torch.float32)            
                 
-                best_idx = select_fn(parent_visits_tensor, child_values, child_visits)
+                best_idx =  select_fn(parent_visits_tensor, child_values, child_visits, child_rewards, child_log_likelihood, child_ref_log_likelihood, current_timesteps)
                 best_child = children[best_idx]
                 
                 # 선택되지 않은 자식들은 재귀적으로 메모리 해제
@@ -405,15 +468,26 @@ class TreePolicy:
     def get_final_latent(self):
         return self.root_nodes.states
     
-    def UCT(self, parent_visits_tensor, child_values, child_visits):
+    @torch.no_grad()
+    def UCT(self, parent_visits_tensor, child_values, child_visits, child_rewards = None, child_log_likelihood = None, child_ref_log_likelihood = None, current_timesteps = None):
         uct_values = child_values / child_visits + self.exploration_constant * torch.sqrt(torch.log(parent_visits_tensor) / child_visits)
         return torch.argmax(uct_values).item()
+    
+    @torch.no_grad()
+    def importance_sampling(self, parent_visits_tensor, child_values, child_visits, child_rewards, child_log_likelihood, child_ref_log_likelihood, current_timesteps):
+        step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
+        discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - current_timesteps) // step_offset - 1)
 
-    def max_value(self, parent_visits_tensor, child_values, child_visits):
+        log_w = child_rewards / self.kl_lagrangian_coef * discount + child_ref_log_likelihood - child_log_likelihood
+        log_w = log_w - torch.max(log_w, dim=0, keepdims=True)[0]
+        return torch.distributions.Categorical(logits=log_w).sample()
+
+    @torch.no_grad()
+    def max_value(self, parent_visits_tensor, child_values, child_visits, child_rewards = None, child_log_likelihood = None, child_ref_log_likelihood = None, current_timesteps = None):
         return torch.argmax(child_values / child_visits).item()
     
     def reset_root_nodes(self):
         self.root_nodes = self.initial_nodes
         
-    def argmax_value(self, parent_visits_tensor, child_values, child_visits):
+    def argmax_value(self, parent_visits_tensor, child_values, child_visits, child_rewards = None, child_log_likelihood = None, child_ref_log_likelihood = None, current_timesteps = None):
         return torch.argmax(child_values).item()

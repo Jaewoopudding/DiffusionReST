@@ -15,7 +15,7 @@ def get_config():
     # samples.
     config.num_epochs = 5
     # number of epochs between saving model checkpoints.
-    config.save_freq = 10
+    config.save_freq = 5
     # number of checkpoints to keep before overwriting old ones.
     config.num_checkpoint_limit = 5
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
@@ -97,7 +97,7 @@ def get_config():
     # DPO or SFT?
     train.type = 'sft' # dpo or sft
     train.beta_dpo = 5000
-    train.negative_gradient = False
+    train.negative_gradient = True
     
     config.eval = eval = ml_collections.ConfigDict()
     eval.num_images_per_prompt = 8
@@ -137,5 +137,17 @@ def get_config():
     search.kl_lagrangian_coef = 0.005
     search.tempering_gamma = 0.008
     search.jump_policy = False
+    search.importance_sampling = True
+    search.gamma = 0.90
+    search.hill_climbing = True
 
+
+    config.buffer = buffer = ml_collections.ConfigDict()
+    
+    buffer.per_prompt_filtering_flag = True
+    buffer.per_prompt_select_flag = False
+    buffer.reward_filtering_criteria = 0.0
+    buffer.clip_score_filtering_criteria = 0.0
+    buffer.off_policy_subset_size = 0
+    
     return config

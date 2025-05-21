@@ -338,7 +338,7 @@ class TreePolicy:
             ).repeat_interleave(duplicate).view(1, duplicate)
 
             if self.ref_unet is not None:
-                ref_noise_pred = self.ref_unet(
+                ref_noise_pred = self.base_unet(
                     latent_model_input,
                     timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else timesteps,
                     encoder_hidden_states=self.prompt_embeds,
@@ -391,7 +391,7 @@ class TreePolicy:
         latent_model_input = latent_model_input.to(self.pipeline.unet.dtype)
         timesteps = timesteps.to(self.pipeline.unet.dtype)
         
-        noise_pred = self.ref_unet(
+        noise_pred = self.base_unet(
             latent_model_input, 
             timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else timesteps, 
             encoder_hidden_states= self.prompt_embeds, 

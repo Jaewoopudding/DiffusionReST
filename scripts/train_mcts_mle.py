@@ -35,6 +35,8 @@ import torchvision
 from buffer import PrioritizedReplayBuffer
 import warnings
 import torch.distributed as dist
+from pathlib import Path
+import re 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
@@ -155,236 +157,226 @@ def _flatten_gathered(obj_list):
             raise TypeError(f"Unexpected type from gather_object: {type(itm)}")
     return flat
 
+
 class SearchDataset(torch.utils.data.Dataset):
     """
-    Build replay-buffer-style dataset out of on- / off-policy samples.
-
-    Pipeline
-    --------
-    1.  concatenate on/off, compute global (or per-prompt) percentile
-        thresholds for the keys in `filtering_criteria`
-    2.  apply **the same filter** to on- and off-policy samples
-    3.  keep all filtered on-policy samples (“anchors”)
-        + pick exactly `off_policy_subset_size = J` *diverse* off-policy samples
-          measured **against those anchors**
-          (if J == 0 → skip this step)
-    4.  final dataset = anchors ∪ selected off-policy
+    데이터는 (1) buffer/epoch_{E}_rank_{R}.pt 에 저장된 샘플 리스트
+            (2) meta_epoch_{E}_rank_{R}.pt 에 저장된 메타-정보
+    두 파일의 *순서가 동일* 하다는 가정하에 lazy-loading 으로 동작한다.
     """
 
-    # ─────────────────────────────────── init ──────────────────────────────────
+    _FILE_RGX = re.compile(r"epoch_(\d+)_rank_(\d+)\.pt")
+
+    # ─────────────────────────────────── init ─────────────────────────────────
     def __init__(
         self,
-        on_policy_samples: List[Dict],
-        off_policy_samples: List[Dict],
-        logger: Optional[Callable],
+        metadata: Dict[str, List],        # gathered_meta   (length = N_total)
+        buffer_path: str | Path,          # "buffer" 디렉터리
+        logger,
+        epoch: int,
         *,
         per_prompt_filtering_flag: bool = True,
         per_prompt_select_flag: bool = False,
-        filtering_criteria: Dict[str, float],       # e.g. {"reward":0.8,"clip_scores":0.5}
-        off_policy_subset_size: int = 0,                   # J (0 → no off-policy extra)
-        batch_size_subset: int = 1024,              # B for greedy
+        filtering_criteria: Dict[str, float] = None,
+        off_policy_subset_size: int = 0,
+        batch_size_subset: int = 1024,
         verbose: bool = True,
     ):
-        if off_policy_subset_size < 0:
-            raise ValueError("off_policy_subset_size (J) must be ≥ 0.")
-
-        self.per_prompt_filtering_flag = per_prompt_filtering_flag
-        self.per_prompt_select_flag = per_prompt_select_flag
-        self.filtering_criteria = filtering_criteria
         self.logger = logger
+        self.per_prompt_filtering_flag = per_prompt_filtering_flag
+        self.per_prompt_select_flag   = per_prompt_select_flag
+        self.filtering_criteria       = filtering_criteria or {}
+        self.off_policy_subset_size   = off_policy_subset_size
+        self.batch_size_subset        = batch_size_subset
 
-        allowed = {"rewards", "clip_scores"}
-        bad = set(filtering_criteria) - allowed
-        if bad:
-            raise ValueError(f"Unknown keys in filtering_criteria: {bad}. Allowed: {allowed}")
+        # -------------------------- 0. 메타 정보 ------------------------------
+        self.meta = metadata                    # {prompts, rewards, clip_scores, image_embedding}
+        N = len(self.meta["prompts"])
+        assert all(len(v) == N for v in self.meta.values()), "메타 각 항목 길이가 다름"
 
-        # ── 0) gather all samples ────────────────────────────────────────────
-        all_samples = on_policy_samples + off_policy_samples
+        # -------------------------- 1. 인덱스 매핑 ----------------------------
+        #   global idx  →  (epoch, rank, local_idx)
+        #   파일별 샘플 수는 한번만 읽어 길이를 캐시
+        self.buffer_root = Path(buffer_path)
+        self._file_len_cache: Dict[tuple[int,int], int] = {}
+        self._file_data_cache: Dict[tuple[int,int], List[dict]] = {}
+        self.current_epoch = epoch
 
-        # ── 1) thresholds from all samples ──────────────────────────────────
-        self.th_global, self.th_per_prompt = self._compute_thresholds(all_samples)
-
-        # ── 2) apply same filter to on & off ────────────────────────────────
-        on_pass  = self._apply_filter(on_policy_samples,  self.th_global, self.th_per_prompt)
-        off_pass = self._apply_filter(off_policy_samples, self.th_global, self.th_per_prompt)
-
-        if off_policy_subset_size > 0 and off_policy_subset_size > len(off_pass):
-            raise ValueError(f"off_policy_subset_size={off_policy_subset_size} but only "
-                             f"{len(off_pass)} off-policy candidates after filtering")
-
-        # ── 3) select J diverse off-policy samples w.r.t. on_pass anchors ───
-        off_diverse = random.sample(off_pass, off_policy_subset_size) if off_policy_subset_size else []
+        # gather order와 동일한 (epoch,rank) 순으로 mapping 을 만든다
+        index_map: list[tuple[int,int,int]] = []
+        cursor = 0
+        for meta_file in sorted(self.buffer_root.glob("meta_epoch_*_rank_*.pt"),
+                                key=lambda p: (int(p.stem.split("_")[2]), int(p.stem.split("_")[-1]))):
+            m = self._FILE_RGX.search(meta_file.name)
+            epoch, rank = int(m.group(1)), int(m.group(2))
+            ds_file = self.buffer_root / f"epoch_{epoch}_rank_{rank}.pt"
+            # 샘플 수(cache)
+            if (epoch, rank) not in self._file_len_cache:
+                self._file_len_cache[(epoch, rank)] = len(torch.load(ds_file, map_location="cpu")["dataset"])
+            L = self._file_len_cache[(epoch, rank)]
+            for i in range(L):
+                index_map.append((epoch, rank, i))
+                cursor += 1
         
-        # off_diverse = []
-        # if off_policy_subset_size > 0:
-        #     off_diverse = self._select_diverse_candidates(
-        #         anchors    = on_pass,
-        #         candidates = off_pass,
-        #         J          = off_policy_subset_size,
-        #         batch_size = batch_size_subset,
-        #     )
+        assert cursor == N, "메타 길이와 실제 파일의 샘플 수가 불일치합니다."
 
-        # ── 4) merge (anchors ∪ off_diverse) ────────────────────────────────
-        self.samples = on_pass + off_diverse    # disjoint by construction
+        self._index_map = index_map                         # 전체 길이 = N
 
-        # ── 5) statistics & report ─────────────────────────────────────────
+        # -------------------------- 2. Threshold 계산 -------------------------
+        self._compute_and_apply_filter(verbose)
+        
+        
+        self._calculate_prompts_stats()          # kept-샘플 통계 만들기
         if verbose:
-            self._calculate_prompts_stats()
-            self.report_dataset_stats()
+            self.report_dataset_stats()          # 화면에 보기 좋게 출력
 
-    def __len__(self):
-        return len(self.samples)
+    # ──────────────────────── helper : threshold & filter ────────────────────
+    def _compute_and_apply_filter(self, verbose: bool):
+        """self.meta 로부터 threshold 계산 & self._kept_idx 생성"""
+        rewards     = np.asarray(self.meta["rewards"],     dtype=float)
+        clip_scores = np.asarray(self.meta["clip_scores"], dtype=float)
+        prompts     = np.asarray(self.meta["prompts"])
 
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-    def _compute_thresholds(self, samples):
-        per_prompt_vals = defaultdict(lambda: defaultdict(list))
-        global_vals     = defaultdict(list)
-
-        for s in samples:
-            for k, q in self.filtering_criteria.items():
-                v = float(s.get(k, np.nan))
-                if not np.isnan(v):
-                    global_vals[k].append(v)
-                    per_prompt_vals[s["prompts"]][k].append(v)
-
-        def q2th(vals, q):
-            if not (0 <= q < 1.):
-                raise ValueError("filtering_criteria values must be in (0,1)")
-            return float(np.quantile(vals, q))
+        # 1) thresholds -------------------------------------------------------
+        th = {}
+        if "rewards" in self.filtering_criteria:
+            q = self.filtering_criteria["rewards"]
+            th["rewards_glob"] = np.quantile(rewards, q)
+        if "clip_scores" in self.filtering_criteria:
+            q = self.filtering_criteria["clip_scores"]
+            th["clip_glob"] = np.quantile(clip_scores, q)
 
         if self.per_prompt_filtering_flag:
-            th_per = {
-                p: {k: q2th(per_prompt_vals[p][k], self.filtering_criteria[k])
-                    for k in self.filtering_criteria}
-                for p in per_prompt_vals
-            }
-            return None, th_per
+            th_per = defaultdict(dict)
+            for p in np.unique(prompts):
+                mask = prompts == p
+                if "rewards" in self.filtering_criteria:
+                    th_per[p]["rewards"] = np.quantile(rewards[mask], self.filtering_criteria["rewards"])
+                if "clip_scores" in self.filtering_criteria:
+                    th_per[p]["clip_scores"] = np.quantile(clip_scores[mask], self.filtering_criteria["clip_scores"])
+            self.th_global, self.th_per_prompt = None, th_per
         else:
-            th_gl = {k: q2th(global_vals[k], self.filtering_criteria[k])
-                     for k in self.filtering_criteria}
-            return th_gl, None
+            self.th_global, self.th_per_prompt = {k.split("_")[0]:v for k,v in th.items()}, None
 
-    def _apply_filter(self, samples, th_global, th_per_prompt):
-        if not self.filtering_criteria:
-            return samples[:]
+        # 2) filter -----------------------------------------------------------
+        all_kept = [i for i in range(len(prompts)) if self._pass_filter(i)]
+        kept_on  = [i for i in all_kept if self._epoch_of_idx(i) == self.current_epoch]
+        kept_off = [i for i in all_kept if self._epoch_of_idx(i) <  self.current_epoch]
+
+        if self.off_policy_subset_size and len(kept_off) > self.off_policy_subset_size:
+            kept_off = random.sample(kept_off, self.off_policy_subset_size)
+        if self.off_policy_subset_size == 0:
+            kept_off.clear()
         
-        if len(samples) == 0:
-            return []
+        
+        self._kept_idx = kept_on + kept_off
 
-        kept = []
-        for s in samples:
-            th = th_per_prompt[s["prompts"]] if th_per_prompt else th_global
-            if all(float(s.get(k, -np.inf)) >= th[k] for k in th):
-                kept.append(s)
-        return kept
+        if verbose:
+            self.logger.info(f"SearchDataset | kept {len(self._kept_idx):,} / {len(self.meta['prompts']):,}")
+            
+    def _epoch_of_idx(self, meta_idx: int) -> int:
+        epoch, _, _ = self._index_map[meta_idx]
+        return epoch
 
-    # ─────────── select J diverse candidates given anchor set ───────────────
-    def _select_diverse_candidates(
-        self,
-        anchors: List[Dict],
-        candidates: List[Dict],
-        J: int,
-        device: Optional[str] = None,
-    ) -> List[Dict]:
-        """
-        k-Center Greedy:  anchors ∪ selected 의 최소거리(= 1-코사인유사도)를
-        최대화하는 후보 J개를 반환한다.
-        """
-        if J == 0 or not candidates:
-            return []
+    # ――― filtering helper
+    def _pass_filter(self, meta_idx: int) -> bool:
+        p   = self.meta["prompts"][meta_idx]
+        rew = float(self.meta["rewards"][meta_idx])
+        clip= float(self.meta["clip_scores"][meta_idx])
 
-        dev = (
-            device
-            or (anchors[0]["image_embedding"].device if anchors else candidates[0]["image_embedding"].device)
-        )
-
-        # --- 임베딩 행렬 준비 ---------------------------------------------------
-        def to_matrix(lst):
-            if not lst:
-                return None
-            t = torch.stack([s["image_embedding"].to(dev) for s in lst])
-            return F.normalize(t.flatten(1), dim=1)  # [N, D]
-
-        emb_A = to_matrix(anchors)          # [|A|, D]  (None 가능)
-        emb_C = to_matrix(candidates)       # [|C|, D]
-
-        N = emb_C.size(0)
-
-        # --- anchors와의 초기 최소거리(1-cosine) 계산 -------------------------
-        if emb_A is not None:
-            init_sim = torch.matmul(emb_C, emb_A.t())          # cosine similarity
-            min_dist = 1 - init_sim.max(dim=1).values          # 1-max-sim → 거리
+        if self.th_per_prompt is not None:
+            th = self.th_per_prompt[p]
         else:
-            min_dist = torch.ones(N, device=dev)               # anchors 없으면 무한대처럼 시작
+            th = self.th_global
 
-        selected_idx = []
-        for _ in range(min(J, N)):
-            # 1) 현재 최소거리가 가장 큰 후보 선택
+        if "rewards" in th and rew < th["rewards"]:
+            return False
+        if "clip_scores" in th and clip < th["clip_scores"]:
+            return False
+        return True
+
+    # ――― fetch meta as dict
+    def _meta_at(self, idx:int)->Dict:
+        return {k: self.meta[k][idx] for k in self.meta}
+
+    # ――― 다양도 선택 (메타만 사용, anchors==candidates 인 경우가 대부분)
+    def _select_diverse_candidates_meta(self, anchors_meta, cand_meta, J:int):
+        if J==0: return list(range(len(cand_meta)))
+        A_emb = torch.stack([m["image_embedding"] for m in anchors_meta])  # [A,D]
+        C_emb = torch.stack([m["image_embedding"] for m in cand_meta])     # [C,D]
+
+        A_emb = F.normalize(A_emb.flatten(1), dim=1)
+        C_emb = F.normalize(C_emb.flatten(1), dim=1)
+
+        if len(anchors_meta):
+            init_sim = C_emb @ A_emb.T
+            min_dist = 1 - init_sim.max(dim=1).values
+        else:
+            min_dist = torch.ones(len(cand_meta))
+
+        picked = []
+        for _ in range(min(J, len(cand_meta))):
             pick = torch.argmax(min_dist).item()
-            selected_idx.append(pick)
-
-            # 2) 새로 뽑은 벡터와의 거리를 이용해 min_dist 업데이트
-            new_vec = emb_C[pick : pick + 1]                   # [1, D]
-            dist_new = 1 - torch.matmul(emb_C, new_vec.t()).squeeze(1)
+            picked.append(pick)
+            dist_new = 1 - (C_emb @ C_emb[pick:pick+1].T).squeeze(1)
             min_dist = torch.minimum(min_dist, dist_new)
-
-            # 3) (선택된 인덱스는 다시 뽑히지 않도록) 거리를 -inf로 설정
             min_dist[pick] = -float("inf")
+        return picked
 
-        # ── per-prompt 모드일 경우 재귀 호출로 클래스/프롬프트별 선택 --------
-        if self.per_prompt_select_flag:
-            chosen_by_prompt = defaultdict(list)
-            for idx in selected_idx:
-                p = candidates[idx]["prompts"]
-                chosen_by_prompt[p].append(idx)
+    # ───────────────────────────── Dataset API ───────────────────────────────
+    def __len__(self):
+        return len(self._kept_idx)
 
-            # 프롬프트별 선택 개수가 부족하면 남은 슬롯을 글로벌로 보충
-            deficit = J - len(selected_idx)
-            if deficit > 0:
-                rest_cands = [c for i, c in enumerate(candidates) if i not in selected_idx]
-                selected_idx += [
-                    candidates.index(c)
-                    for c in self._select_diverse_candidates(anchors, rest_cands, deficit, device=dev)
-                ]
+    def __getitem__(self, idx:int):
+        """idx → 실제 샘플(dict).  디스크에서 읽고 메모리 캐시에 올린다."""
+        real_idx = self._kept_idx[idx]
+        epoch, rank, local_idx = self._index_map[real_idx]
 
-        return [candidates[i] for i in selected_idx]
+        # 1) 파일 cache 로드
+        key = (epoch, rank)
+        if key not in self._file_data_cache:
+            file_path = self.buffer_root / f"epoch_{epoch}_rank_{rank}.pt"
+            self._file_data_cache[key] = torch.load(file_path, map_location="cpu")["dataset"]
+        sample = self._file_data_cache[key][local_idx]
 
-    # ──────────────────────────── statistics ────────────────────────────────
+        return sample
+    
     def _calculate_prompts_stats(self):
-        self.prompts_stats = {}
-        for s in self.samples:
-            p = s["prompts"]
-            st = self.prompts_stats.setdefault(p, {"rewards": [], "clip": [], "n": 0})
-            st["rewards"].append(float(s["rewards"]))
-            st["clip"].append(float(s.get("clip_scores", np.nan)))
+        self.prompts_stats = defaultdict(lambda: {"rewards": [], "clip": [], "n": 0})
+
+        for idx in self._kept_idx:
+            p = self.meta["prompts"][idx]
+            r = float(self.meta["rewards"][idx])
+            c = float(self.meta["clip_scores"][idx])
+
+            st = self.prompts_stats[p]
+            st["rewards"].append(r)
+            st["clip"].append(c)
             st["n"] += 1
-        
+
+
     def report_dataset_stats(self):
         self.logger.info("")
         self.logger.info("────────────────── Dataset summary ────────────────────")
+        total_kept = len(self._kept_idx)
 
-        # 1) per-prompt 행별로:  통계 + threshold 함께 출력
         for p, st in self.prompts_stats.items():
-            mean_r   = np.nanmean(st["rewards"])
-            mean_c   = np.nanmean(st["clip"])
-            n        = st["n"]
+            mean_r = np.nanmean(st["rewards"])
+            mean_c = np.nanmean(st["clip"])
+            n      = st["n"]
 
-            # ── 해당 prompt 의 임계값 가져오기 ─────────────────────
-            if self.th_per_prompt:
-                th = self.th_per_prompt[p]
-            else:                          # 글로벌 모드
-                th = self.th_global
+            # prompt 별 threshold 문자열
+            th = self.th_per_prompt[p] if self.th_per_prompt else self.th_global
             th_str = ", ".join(f"{k} ≥ {v:.4f}" for k, v in th.items())
 
-            line = (f"{p[:36]:<36} | R={mean_r:5.3f} | clip={mean_c:5.3f} "
-                    f"| n={n:4d} | threshold: {th_str}")
-            self.logger.info(line)
+            self.logger.info(
+                f"{p[:36]:<36} | R={mean_r:5.3f} | clip={mean_c:5.3f} "
+                f"| n={n:4d} | threshold: {th_str}"
+            )
 
         self.logger.info("")
         self.logger.info(f"Filtering criteria (quantile) : {self.filtering_criteria}")
-        self.logger.info(f"Final sample count            : {len(self.samples)}")
+        self.logger.info(f"Final sample count            : {total_kept}")
         self.logger.info("───────────────────────────────────────────────────────\n")
 
 
@@ -762,19 +754,16 @@ def main(_):
     resizer = torchvision.transforms.Resize(224)
     normalizer = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
     
-    if config.train.kl_coef > 0 or config.train.type == 'dpo':
 
-        unet_pretrained = UNet2DConditionModel.from_pretrained(
-            config.pretrained.model,
-            revision=config.pretrained.revision,
-            subfolder="unet",
-        ).to(accelerator.device, dtype=inference_dtype)
+    unet_pretrained = UNet2DConditionModel.from_pretrained(
+        config.pretrained.model,
+        revision=config.pretrained.revision,
+        subfolder="unet",
+    ).to(accelerator.device, dtype=inference_dtype)
+    
+    # Prepare everything with our `accelerator`.
+    unet, optimizer, unet_pretrained = accelerator.prepare(unet, optimizer, unet_pretrained)
 
-        # Prepare everything with our `accelerator`.
-        unet, optimizer, unet_pretrained = accelerator.prepare(unet, optimizer, unet_pretrained)
-        
-    else:
-        unet, optimizer = accelerator.prepare(unet, optimizer)
         
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
@@ -817,7 +806,6 @@ def main(_):
 
     
     global_step = 0
-    off_policy_dataset_per_gpu = []
     
     
     for epoch in range(first_epoch, config.num_epochs):
@@ -1143,57 +1131,62 @@ def main(_):
                 return x
 
 
-        ## SAVE 하기 전, rewards랑 clip_score, 그리고 embedding을 따로 저장.
-        ## 따로 저장한 rewards, clipscore, embedding을 불러오고, filtering 대상을 각 gpu process에서 제거함.
-        ## 제거한 데이터를 제외한 나머지 데이터를 buffer_path에 저장함
-        
+        # SAVE ON_POLICY DATASET
         samples_batched_cpu = [_to_cpu(s) for s in samples_batched]
         for i, sample in enumerate(samples_batched_cpu):
             on_policy_dataset_per_gpu.append(sample)
 
         on_policy_dataset_per_gpu  = _strip_unpicklable(on_policy_dataset_per_gpu)
-        off_policy_dataset_per_gpu = _strip_unpicklable(off_policy_dataset_per_gpu)
         
         rank = dist.get_rank() if dist.is_initialized() else 0
-        buffer_dir = os.path.join("buffer", config.run_name, f"epoch{epoch+1}")
+        buffer_dir = os.path.join("buffer", config.run_name)
         os.makedirs(buffer_dir, exist_ok=True)
-        buffer_path = os.path.join(buffer_dir, f"buffer_{rank}.pt")
+        buffer_path = os.path.join(buffer_dir, f"epoch_{epoch}_rank_{rank}.pt")
+        meta_path = os.path.join(buffer_dir, f"meta_epoch_{epoch}_rank_{rank}.pt")
+
         torch.save({
-            "on_policy_dataset": on_policy_dataset_per_gpu,
-            "off_policy_dataset": off_policy_dataset_per_gpu,
+            "dataset": on_policy_dataset_per_gpu,
         }, buffer_path)
-        
-        
+
+
+        meta = {
+            "prompts"        : [s["prompts"] for s in samples_batched_cpu],       # str list (길이 = B)
+            "rewards"        : torch.stack([s["rewards"].cpu()        for s in samples_batched_cpu]),
+            "clip_scores"    : torch.stack([s["clip_scores"].cpu()    for s in samples_batched_cpu]),
+            "image_embedding": torch.stack([s["image_embedding"].cpu() for s in samples_batched_cpu]),
+        }
+        torch.save(meta, meta_path)     #  buffer/meta_epoch_{E}_rank_{R}.pt  로 저장
+
         if dist.is_initialized():
             accelerator.wait_for_everyone()
-        
-        
-        on_policy_dataset = []
-        off_policy_dataset = []
-        for r in range(world_size):
-            path = os.path.join(buffer_dir, f"buffer_{r}.pt")
-            data = torch.load(path)
-            on_policy_dataset.extend(data["on_policy_dataset"])
-            off_policy_dataset.extend(data["off_policy_dataset"])
 
-        ## Dataset은 on_policy_dataset과 off_policy_dataset list를 받는 게 아니라 buffer의 경로를 받아옴.
-        ## 요청이 들어올 때마다 데이터를 읽고 반환함. 메모리 절약을 위해서임. 
-        ## 그에 맞게 SearchDataset 코드를 수정하는 방안을 제시할 것.
-        
+        gathered_meta = {k: [] for k in meta}    # {prompts:[], rewards:[], …}
+
+        for e in range(epoch + 1):               # 0 ~ 현재 epoch
+            for r in range(world_size):          # rank 순회
+                m = torch.load(os.path.join(buffer_dir, f"meta_epoch_{e}_rank_{r}.pt"), map_location="cpu")
+                for k in gathered_meta:
+                    gathered_meta[k].append(m[k])
+
+        if dist.is_initialized():
+            accelerator.wait_for_everyone()
+
+        gathered_meta["prompts"]         = list(itertools.chain.from_iterable(gathered_meta["prompts"]))
+        gathered_meta["rewards"]         = torch.cat(gathered_meta["rewards"])
+        gathered_meta["clip_scores"]     = torch.cat(gathered_meta["clip_scores"])
+        gathered_meta["image_embedding"] = torch.cat(gathered_meta["image_embedding"])
+
         replaybuffer = SearchDataset(
-            on_policy_samples   = on_policy_dataset,
-            off_policy_samples  = off_policy_dataset,
+            metadata   = gathered_meta,
+            buffer_path  = os.path.join("buffer", config.run_name),
+            epoch     = epoch,
             per_prompt_filtering_flag = config.buffer.per_prompt_filtering_flag,
             per_prompt_select_flag = config.buffer.per_prompt_select_flag,
             filtering_criteria  = {"rewards": config.buffer.reward_filtering_criteria, "clip_scores": config.buffer.clip_score_filtering_criteria},
-            off_policy_subset_size     = 0 if len(off_policy_dataset) == 0 else config.buffer.off_policy_subset_size, # off policy sample 중 prompt당 3개씩 가져오기. 
+            off_policy_subset_size     = 0 if epoch == 0 else config.buffer.off_policy_subset_size, # off policy sample 중 prompt당 3개씩 가져오기. 
             batch_size_subset   = 2048,
             logger              = logger
         )
-
-        if config.buffer.off_policy_subset_size > 0:
-            for i, sample in enumerate(samples_batched_cpu):
-                off_policy_dataset_per_gpu.append(sample)
 
         dataloader = torch.utils.data.DataLoader(
             replaybuffer,
@@ -1211,6 +1204,7 @@ def main(_):
 
         # del all_on_policy_samples
         # del all_off_policy_samples
+        del meta
         del samples_batched_cpu
         del samples_batched
         del samples
@@ -1311,15 +1305,6 @@ def main(_):
                         ):
                             with accelerator.accumulate(unet):
                                 with autocast():
-                                    # print_memory_usage()
-                                    
-                                    # snapshot = tracemalloc.take_snapshot()
-                                    # top_stats = snapshot.statistics('lineno')
-
-                                    # print("[ Top 5 memory consumers ]")
-                                    # for stat in top_stats[:5]:
-                                    #     print(stat)
-
                                     latents = sample['latents'][:, j]
                                     timesteps = sample['timesteps'][:, j]
                                     next_latents = sample['next_latents'][:, j]
@@ -1731,7 +1716,8 @@ def main(_):
             del eval_images_list
             del eval_rewards
             del eval_images_tensor
-            
+            del gathered_meta
+            del buffers
             
             gc.collect()
             torch.cuda.empty_cache()    

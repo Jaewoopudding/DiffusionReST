@@ -999,6 +999,7 @@ def main(_):
         clip_scores = accelerator.gather(samples["clip_scores"]).cpu().numpy()
         # metrics = {key: accelerator.gather(torch.stack([s[key] for s in samples])).cpu().numpy() for key in eval_results.keys()}
         
+        
         log_dict = {
             "reward": rewards,
             "reward_mean": rewards.mean(),
@@ -1007,6 +1008,16 @@ def main(_):
             "clip_score_mean": clip_scores.mean(),
             "clip_score_std": clip_scores.std(),
         }
+        
+        if config.reward_fn == "aesthetic_score_diff_clipped":
+            log_dict = {
+                "reward": rewards + 9,
+                "reward_mean": rewards.mean() + 9,
+                "reward_std": rewards.std(),
+                "clip_score": clip_scores,
+                "clip_score_mean": clip_scores.mean(),
+                "clip_score_std": clip_scores.std(),
+            }
 
         accelerator.log(log_dict, step=global_step)
 
@@ -1064,6 +1075,13 @@ def main(_):
                 "eval_reward_mean": eval_rewards.mean(),
                 "eval_reward_std": eval_rewards.std(),
             }
+
+            if config.reward_fn == "aesthetic_score_diff_clipped":
+                log_dict = {
+                    "eval_reward": eval_rewards + 9,
+                    "eval_reward_mean": eval_rewards.mean() + 9,
+                    "eval_reward_std": eval_rewards.std(),
+                }
 
             accelerator.log(log_dict, step=global_step)
 
@@ -1704,6 +1722,14 @@ def main(_):
                 "eval_reward_mean": eval_rewards.mean(),
                 "eval_reward_std": eval_rewards.std(),
             }
+            
+            if config.reward_fn == "aesthetic_score_diff_clipped":
+                log_dict = {
+                    "eval_reward": eval_rewards + 9,
+                    "eval_reward_mean": eval_rewards.mean() + 9,
+                    "eval_reward_std": eval_rewards.std(),
+                }
+            
             accelerator.log(log_dict, step=global_step)
 
 

@@ -72,7 +72,7 @@ def aesthetic_score_diff_clipped(torch_dtype=torch.float32):
         im_pix = im_pix.to(torch_dtype)
         scorer_ = scorer.to(im_pix.device)
         rewards = scorer_(im_pix)
-        return -torch.abs(9-rewards), -torch.abs(9-rewards)
+        return -torch.abs(8.5-rewards), -torch.abs(8.5-rewards)
     return loss_fn
 
 

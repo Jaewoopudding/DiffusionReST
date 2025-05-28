@@ -1,0 +1,31 @@
+accelerate launch --main_process_port 29502 scripts/train_mcts_mle.py \
+--config config/svdd_aesthetic_mle.py \
+--config.search.duplicate 4 \
+--config.run_name single_mdp6 \
+--config.train.learning_rate 3e-4 \
+--config.train.total_batch_size 64 \
+--config.train.gradient_steps_per_improve_step 16000 \
+--config.train.improve_steps 1 \
+--config.sample.num_batches_per_epoch 128 \
+--config.prompt_fn simple_animals \
+--config.train.kl_coef 0.01 \
+--config.train.type 'sft' \
+--config.eval.num_images_per_prompt 8 \
+--config.sample.num_prompts_per_batch 8 \
+--config.sample.num_steps 50 \
+--config.search.value_gradient \
+--config.reward_fn aesthetic_score_diff \
+--config.search.kl_lagrangian_coef 0.0025 \
+--config.num_epochs 100 \
+--noconfig.multistep_mdp \
+--config.search.gamma 0.90 \
+--noconfig.train.negative_gradient \
+--config.search.importance_sampling \
+--config.search.hill_climbing \
+--config.buffer.per_prompt_filtering_flag \
+--noconfig.buffer.per_prompt_select_flag \
+--config.buffer.reward_filtering_criteria 0.0 \
+--config.buffer.clip_score_filtering_criteria 0.0 \
+--config.buffer.off_policy_subset_size 0 \
+--config.save_freq 100 \
+--config.train.clip_range 0.0001 \

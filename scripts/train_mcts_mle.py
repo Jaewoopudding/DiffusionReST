@@ -53,6 +53,13 @@ from typing import Optional, Callable, Dict, Any, List, DefaultDict
 
 import psutil
 
+
+def cycle(iterable):
+    while True:
+        for x in iterable:
+            yield x
+
+
 def print_memory_usage():
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info()
@@ -1011,8 +1018,8 @@ def main(_):
         
         if config.reward_fn == "aesthetic_score_diff_clipped":
             log_dict = {
-                "reward": rewards + 9,
-                "reward_mean": rewards.mean() + 9,
+                "reward": rewards + 8.5,
+                "reward_mean": rewards.mean() + 8.5,
                 "reward_std": rewards.std(),
                 "clip_score": clip_scores,
                 "clip_score_mean": clip_scores.mean(),
@@ -1078,8 +1085,8 @@ def main(_):
 
             if config.reward_fn == "aesthetic_score_diff_clipped":
                 log_dict = {
-                    "eval_reward": eval_rewards + 9,
-                    "eval_reward_mean": eval_rewards.mean() + 9,
+                    "eval_reward": eval_rewards + 8.5,
+                    "eval_reward_mean": eval_rewards.mean() + 8.5,
                     "eval_reward_std": eval_rewards.std(),
                 }
 
@@ -1106,13 +1113,14 @@ def main(_):
 
         # shuffle along time dimension independently for each sample
         total_batch_size, num_timesteps = samples["timesteps"].shape
-        perms = torch.stack([torch.randperm(num_timesteps, device=accelerator.device) for _ in range(total_batch_size)])
+        if config.multistep_mdp:
+            perms = torch.stack([torch.randperm(num_timesteps, device=accelerator.device) for _ in range(total_batch_size)])
 
-        for key in ["timesteps", "latents", "next_latents", "log_probs", "eval_latents", "eval_next_latents", "eval_log_probs"]:
-            samples[key] = samples[key][
-                torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                perms,
-            ]
+            for key in ["timesteps", "latents", "next_latents", "log_probs", "eval_latents", "eval_next_latents", "eval_log_probs"]:
+                samples[key] = samples[key][
+                    torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                    perms,
+                ]
 
 
         samples_batched = {
@@ -1524,6 +1532,7 @@ def main(_):
                 ################################################
                 # 샘플 잔뜩 뽑고, buffer에서 뽑아서 사용하는 방식을 채택한다.
                 ################################################
+                dataloader_iter = iter(dataloader) 
                 for step in tqdm(
                     range(config.train.gradient_steps_per_improve_step),
                     desc=f"Grow: {epoch + 1} | Improve {improve_steps + 1} | Total gradient steps {config.train.gradient_steps_per_improve_step} ",
@@ -1531,16 +1540,13 @@ def main(_):
                     leave=True,
                     disable=not accelerator.is_local_main_process,
                 ):
-                    possible_idxs = []
-                    for i in range(num_prompts):
-                        if len(buffers[i].buffer) > 0:
-                            possible_idxs.append(i)
                     samples_from_buffer = []
-                    for _ in range(int(config.train.total_batch_size / (accelerator.num_processes))):
-                        buffer = buffers[random.choice(possible_idxs)]
-                        threshold = -1e3 if config.train.type == 'dpo' else buffer.reward_median()
-                        samples_from_buffer.extend(buffer.sample(1, target_threshold={"rewards": threshold}))
-                        
+                    try:
+                        samples_from_buffer.append(next(dataloader_iter))
+                    except StopIteration:
+                        dataloader_iter = iter(dataloader)
+                        samples_from_buffer.append(next(dataloader_iter))
+                    
                     for j, sample in enumerate(tqdm(
                         samples_from_buffer,
                         position=1,
@@ -1656,7 +1662,7 @@ def main(_):
                         
                             # if accelerator.sync_gradients:
                                 # assert (int(config.train.gradient_steps_per_improve_step / (accelerator.num_processes * config.train.batch_size))) % config.train.gradient_accumulation_steps == 0
-            
+                del dataloader_iter
 
             eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(
                 pipeline=pipeline,
@@ -1725,8 +1731,8 @@ def main(_):
             
             if config.reward_fn == "aesthetic_score_diff_clipped":
                 log_dict = {
-                    "eval_reward": eval_rewards + 9,
-                    "eval_reward_mean": eval_rewards.mean() + 9,
+                    "eval_reward": eval_rewards + 8.5,
+                    "eval_reward_mean": eval_rewards.mean() + 8.5,
                     "eval_reward_std": eval_rewards.std(),
                 }
             

@@ -35,11 +35,6 @@ duck
 goose
 bee
 pig
-turkey
 fly
 llama
 camel
-bat
-gorilla
-hedgehog
-kangaroo

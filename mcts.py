@@ -478,7 +478,7 @@ class TreePolicy:
         step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
         discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - current_timesteps) // step_offset - 1)
 
-        log_w = child_rewards / self.kl_lagrangian_coef * discount + child_ref_log_likelihood - child_log_likelihood
+        log_w = torch.nan_to_num(child_rewards) / self.kl_lagrangian_coef * discount + child_ref_log_likelihood - child_log_likelihood
         log_w = log_w - torch.max(log_w, dim=0, keepdims=True)[0]
         return torch.distributions.Categorical(logits=log_w).sample()
 

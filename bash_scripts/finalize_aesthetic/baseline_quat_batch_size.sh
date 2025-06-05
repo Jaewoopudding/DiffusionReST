@@ -19,7 +19,7 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.num_epochs 300 \
 --config.multistep_mdp \
 --config.search.gamma 0.90 \
---noconfig.train.negative_gradient \    
+--noconfig.train.negative_gradient \
 --config.search.importance_sampling \
 --config.search.hill_climbing \
 --config.buffer.per_prompt_filtering_flag \

@@ -98,6 +98,7 @@ def get_config():
     train.type = 'sft' # dpo or sft
     train.beta_dpo = 5000
     train.negative_gradient = True
+    train.accumulation_multipler = 1
     
     config.eval = eval = ml_collections.ConfigDict()
     eval.num_images_per_prompt = 8

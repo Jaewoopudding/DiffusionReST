@@ -555,7 +555,7 @@ def main(_):
         accumulation_steps = int(config.train.total_batch_size / (torch.cuda.device_count()))
         
     from accelerate.utils import GradientAccumulationPlugin
-    plugin = GradientAccumulationPlugin(num_steps=accumulation_steps ,sync_with_dataloader=False)
+    plugin = GradientAccumulationPlugin(num_steps=accumulation_steps * config.train.accumulation_multipler, sync_with_dataloader=False)
     accelerator = Accelerator(
         log_with="wandb",
         mixed_precision=config.mixed_precision,

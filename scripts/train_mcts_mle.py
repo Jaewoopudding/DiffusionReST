@@ -1742,8 +1742,6 @@ def main(_):
             # make sure we did an optimization step at the end of the inner epoch
             assert accelerator.sync_gradients
             accelerator._dataloaders.clear()
-            del replaybuffer
-            del dataloader
             del eval_samples
             del eval_images_list
             del eval_rewards
@@ -1752,8 +1750,12 @@ def main(_):
             del buffers
             
             gc.collect()
-            torch.cuda.empty_cache()    
+            torch.cuda.empty_cache()
 
+        del replaybuffer
+        del dataloader    
+        gc.collect()
+        torch.cuda.empty_cache()
         if epoch != 0 and epoch % config.save_freq == 0 and accelerator.is_main_process:
             accelerator.save_state()
 

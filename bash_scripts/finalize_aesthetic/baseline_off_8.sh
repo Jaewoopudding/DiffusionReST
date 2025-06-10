@@ -1,7 +1,7 @@
 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config config/svdd_aesthetic_mle.py \
 --config.search.duplicate 4 \
---config.run_name baseline_off_4 \
+--config.run_name baseline_off_8 \
 --config.train.learning_rate 3e-4 \
 --config.train.total_batch_size 64 \
 --config.train.gradient_steps_per_improve_step 500 \

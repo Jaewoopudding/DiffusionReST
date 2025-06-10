@@ -1,11 +1,11 @@
 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config config/svdd_aesthetic_mle.py \
 --config.search.duplicate 4 \
---config.run_name baseline_off_4 \
+--config.run_name baseline_off_16 \
 --config.train.learning_rate 3e-4 \
 --config.train.total_batch_size 64 \
 --config.train.gradient_steps_per_improve_step 500 \
---config.train.improve_steps 1 \
+--config.train.improve_steps 2 \
 --config.sample.num_batches_per_epoch 8 \
 --config.prompt_fn simple_animals \
 --config.train.kl_coef 0.01 \
@@ -26,7 +26,7 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --noconfig.buffer.per_prompt_select_flag \
 --config.buffer.reward_filtering_criteria 0.0 \
 --config.buffer.clip_score_filtering_criteria 0.0 \
---config.buffer.off_policy_subset_size 8 \
+--config.buffer.off_policy_subset_size 16 \
 --config.save_freq 1000 \
 --config.train.clip_range 0.0001 \
 --config.train.accumulation_multipler 1 \

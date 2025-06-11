@@ -54,106 +54,163 @@ def parse_aesthetic(fname: str):
 
 # ────────────────────────────── EVALUATION ──────────────────────────
 def evaluate_folder(folder: str, K: int = 20) -> Dict[str, float]:
+    """
+    한 폴더 안의 이미지들을 평가하여 다양한 품질·다양성 지표를 계산한다.
+    - K: TCE 계산 시 취할 고유값 개수
+    반환값(res)은 CSV로도 저장되며, 각 키가 run()의 plotting 루프에 자동 반영된다.
+    """
+    # -----------------------------------------------------------------
+    # 1) 이미지 수집
+    # -----------------------------------------------------------------
     imgs = [os.path.join(folder, f) for f in os.listdir(folder)
-            if f.lower().endswith(("png", "jpg", "jpeg")) and
-               "ess" not in f and "intermediate_rewards" not in f]
+            if f.lower().endswith(("png", "jpg", "jpeg"))
+            and "ess" not in f and "intermediate_rewards" not in f]
     if not imgs:
         raise RuntimeError("no images")
 
+    # -----------------------------------------------------------------
+    # 2) 품질 점수 / 임베딩 저장
+    # -----------------------------------------------------------------
     qual = {k: [] for k in ["aesthetic", "hps", "imagereward", "pick", "clip"]}
     clip_e, dream_e, lpips_imgs = [], [], []
 
-    # ─── 프롬프트별 임베딩을 따로 모으기 위한 dict ───
-    clip_grp, dream_grp = {}, {}               # {prompt: [emb, ...]}
-    
+    # prompt-별 그룹
+    clip_grp, dream_grp, lpips_grp = {}, {}, {}
+
     for path in imgs:
+        # ---- prompt 식별 ----
         try:
             prompt = identify_prompt(os.path.basename(path))
-        except ValueError:
+        except ValueError:      # prompt 토큰 못 찾으면 스킵
             continue
 
+        # ---- aesthetic (파일명에 점수 포함된 경우) ----
         aest = parse_aesthetic(path)
         if aest is not None:
             qual["aesthetic"].append(aest)
 
-        img_t = torchvision.transforms.ToTensor()(Image.open(path).convert("RGB")).unsqueeze(0).to(device)
+        # ---- 이미지 텐서 ----
+        img_t = torchvision.transforms.ToTensor()(
+            Image.open(path).convert("RGB")
+        ).unsqueeze(0).to(device)
+
         with torch.no_grad():
+            # ---- 개별 품질 지표 ----
             qual["clip"].append(clip_fn(img_t, prompt).item())
             qual["hps"].append(hps_fn(img_t, prompt).item())
             qual["imagereward"].append(imagereward_fn(img_t, prompt).item())
             qual["pick"].append(pick_fn(img_t, prompt).item())
 
+            # ---- 임베딩 ----
             c_emb = clip_model.get_image_features(
-                preprocess_clip(path).unsqueeze(0).to(device)).cpu().numpy().squeeze()
+                preprocess_clip(path).unsqueeze(0).to(device)
+            ).cpu().numpy().squeeze()
             d_emb = embed_dreamsim(path).cpu().numpy().squeeze()
 
             clip_e.append(c_emb)
             dream_e.append(d_emb)
             lpips_imgs.append(preprocess_lpips(path).to(device))
 
-            # ─── prompt 그룹에 추가 ───
+            # ---- prompt-별 그룹에 저장 ----
             clip_grp.setdefault(prompt, []).append(c_emb)
             dream_grp.setdefault(prompt, []).append(d_emb)
+            lpips_grp.setdefault(prompt, []).append(lpips_imgs[-1])
 
     clip_e, dream_e = map(np.asarray, (clip_e, dream_e))
 
-    # ───────────── 전체(모든 이미지) 다양성 ─────────────
-    clip_d   = pdist(clip_e,  "cosine")
-    dream_d  = pdist(dream_e, "cosine")
-
-    # ───────────── prompt-별 다양성 ─────────────
-    clip_d_prompt = []
-    for emb_list in clip_grp.values():
-        if len(emb_list) > 1:                 # 한 prompt에 이미지 ≥2장일 때만 계산
-            clip_d_prompt.append(pdist(np.asarray(emb_list), "cosine").mean())
-    dream_d_prompt = []
-    for emb_list in dream_grp.values():
-        if len(emb_list) > 1:
-            dream_d_prompt.append(pdist(np.asarray(emb_list), "cosine").mean())
-
-    # ────────────────── 나머지 지표 ──────────────────
-    cov     = np.cov(clip_e, rowvar=False)
-    eigvals = np.linalg.eigvalsh(cov)[-K:]
-    tce     = (K/2)*np.log(2*np.pi*np.e) + 0.5*np.sum(np.log(eigvals))
+    # -----------------------------------------------------------------
+    # 3) 전체 다양성 지표
+    # -----------------------------------------------------------------
+    clip_d  = pdist(clip_e,  "cosine")
+    dream_d = pdist(dream_e, "cosine")
     lp_d    = [lpips_model(lpips_imgs[i], lpips_imgs[j]).item()
-               for i in range(len(lpips_imgs)) for j in range(i+1, len(lpips_imgs))]
+               for i in range(len(lpips_imgs)) for j in range(i + 1, len(lpips_imgs))]
 
-    def ms(a):
-        return (float(np.mean(a)), float(np.std(a))) if a else (float("nan"), float("nan"))
+    # 전체 TCE (Clip 임베딩)
+    cov_all = np.cov(clip_e, rowvar=False)
+    eig_all = np.linalg.eigvalsh(cov_all)[-K:]
+    tce_all = (K/2) * np.log(2*np.pi*np.e) + 0.5 * np.sum(np.log(eig_all))
 
-    res = {}
+    # -----------------------------------------------------------------
+    # 4) prompt-별 다양성 지표
+    # -----------------------------------------------------------------
+    def mean_pairwise_lpips(tensors):
+        """주어진 텐서 리스트에 대해 평균 LPIPS 거리."""
+        if len(tensors) < 2:
+            return None
+        d = [lpips_model(tensors[i], tensors[j]).item()
+             for i in range(len(tensors)) for j in range(i + 1, len(tensors))]
+        return np.mean(d)
+
+    clip_d_prompt, dream_d_prompt, lpips_d_prompt, tce_prompt = [], [], [], []
+
+    for p in clip_grp:
+        n = len(clip_grp[p])
+        if n < 2:
+            continue   # 이미지가 1장뿐이면 다양성 정의 불가
+
+        # Clip·DreamSim 다양성
+        clip_d_prompt.append(pdist(np.asarray(clip_grp[p]), "cosine").mean())
+        dream_d_prompt.append(pdist(np.asarray(dream_grp[p]), "cosine").mean())
+
+        # LPIPS 다양성
+        lp_val = mean_pairwise_lpips(lpips_grp[p])
+        if lp_val is not None:
+            lpips_d_prompt.append(lp_val)
+
+        # TCE (Clip 임베딩)
+        emb_p = np.asarray(clip_grp[p])
+        cov_p = np.cov(emb_p, rowvar=False)
+        eig_p = np.linalg.eigvalsh(cov_p)
+        d = min(K, eig_p.size)
+        tce_prompt.append(
+            (d/2) * np.log(2*np.pi*np.e) + 0.5 * np.sum(np.log(eig_p[-d:]))
+        )
+
+    # -----------------------------------------------------------------
+    # 5) 결과 집계
+    # -----------------------------------------------------------------
+    def ms(arr):
+        return (float(np.mean(arr)), float(np.std(arr))) if arr else (float("nan"), float("nan"))
+
+    res: Dict[str, float] = {}
     for k in qual:
         res[f"mean_{k}"], res[f"std_{k}"] = ms(qual[k])
 
-    # ─── 전체 다양성 ───
+    # 전체 다양성
     res.update(
-        clip_diversity=float(np.mean(clip_d)),
-        clip_diversity_se=float(np.std(clip_d)/math.sqrt(clip_d.size)),
-        dreamsim_diversity=float(np.mean(dream_d)),
-        dreamsim_diversity_se=float(np.std(dream_d)/math.sqrt(dream_d.size)),
+        clip_diversity            = float(np.mean(clip_d)),
+        clip_diversity_se         = float(np.std(clip_d) / math.sqrt(clip_d.size)),
+        dreamsim_diversity        = float(np.mean(dream_d)),
+        dreamsim_diversity_se     = float(np.std(dream_d) / math.sqrt(dream_d.size)),
+        lpips_mean                = float(np.mean(lp_d)),
+        lpips_std                 = float(np.std(lp_d)),
+        tce_clip                  = float(tce_all),
     )
 
-    # ─── prompt-별 다양성 ───
+    # prompt-별 다양성
     res.update(
-        clip_diversity_prompt=float(np.mean(clip_d_prompt)) if clip_d_prompt else float("nan"),
-        clip_diversity_prompt_se=float(np.std(clip_d_prompt)/math.sqrt(len(clip_d_prompt)))
-                                 if clip_d_prompt else float("nan"),
-        dreamsim_diversity_prompt=float(np.mean(dream_d_prompt)) if dream_d_prompt else float("nan"),
-        dreamsim_diversity_prompt_se=float(np.std(dream_d_prompt)/math.sqrt(len(dream_d_prompt)))
-                                     if dream_d_prompt else float("nan"),
+        clip_diversity_prompt        = float(np.mean(clip_d_prompt)) if clip_d_prompt else float("nan"),
+        clip_diversity_prompt_se     = float(np.std (clip_d_prompt) / math.sqrt(len(clip_d_prompt)))
+                                       if clip_d_prompt else float("nan"),
+        dreamsim_diversity_prompt    = float(np.mean(dream_d_prompt)) if dream_d_prompt else float("nan"),
+        dreamsim_diversity_prompt_se = float(np.std (dream_d_prompt) / math.sqrt(len(dream_d_prompt)))
+                                       if dream_d_prompt else float("nan"),
+        lpips_diversity_prompt       = float(np.mean(lpips_d_prompt)) if lpips_d_prompt else float("nan"),
+        lpips_diversity_prompt_se    = float(np.std (lpips_d_prompt) / math.sqrt(len(lpips_d_prompt)))
+                                       if lpips_d_prompt else float("nan"),
+        tce_clip_prompt              = float(np.mean(tce_prompt))     if tce_prompt     else float("nan"),
+        tce_clip_prompt_se           = float(np.std (tce_prompt) / math.sqrt(len(tce_prompt)))
+                                       if tce_prompt else float("nan"),
     )
 
-    # ─── 나머지 ───
-    res.update(
-        tce_clip=float(tce),
-        lpips_mean=float(np.mean(lp_d)),
-        lpips_std=float(np.std(lp_d)),
-    )
-
-    # 저장
+    # -----------------------------------------------------------------
+    # 6) CSV 저장 및 반환
+    # -----------------------------------------------------------------
     with open(os.path.join(folder, "eval_metrics.csv"), "w", newline="") as f:
-        csv.writer(f).writerow(res.keys())
-        csv.writer(f).writerow([f"{v:.5f}" for v in res.values()])
+        writer = csv.writer(f)
+        writer.writerow(res.keys())
+        writer.writerow([f"{v:.5f}" for v in res.values()])
 
     torch.cuda.empty_cache()
     return res

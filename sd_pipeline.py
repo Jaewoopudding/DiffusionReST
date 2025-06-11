@@ -1,6 +1,5 @@
 from diffusers import StableDiffusionPipeline 
 import torch 
-from aesthetic_scorer import SinusoidalTimeMLP
 from typing import Callable, List, Optional, Union, Dict, Any
 import torchvision
 import numpy as np

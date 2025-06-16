@@ -3,6 +3,14 @@ import io
 import numpy as np
 import torch
 import torchvision
+import ImageReward as RM
+from torchvision.transforms import Compose, Resize, CenterCrop, Normalize
+try:
+    from torchvision.transforms import InterpolationMode
+    BICUBIC = InterpolationMode.BICUBIC
+except ImportError:
+    BICUBIC = Image.BICUBIC
+
 
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):
@@ -357,3 +365,103 @@ def llava_bertscore():
         return np.array(all_scores), {k: np.array(v) for k, v in all_info.items()}
 
     return _fn
+
+
+
+def hps_score(
+    inference_dtype=None, 
+    device='cuda', 
+    return_loss=False, 
+):
+    from ddpo_pytorch.hpsv2_scorer import HPSv2Scorer
+
+    scorer = HPSv2Scorer(dtype=torch.float32, device=device)
+    scorer.requires_grad_(False)
+
+    if not return_loss:
+        def _fn(images, prompts, metadata=None):
+            if images.min() < 0: # normalize unnormalized images
+                images = ((images / 2) + 0.5).clamp(0, 1)
+            scores = scorer(images, prompts)
+            return scores, {}
+
+        return _fn
+
+    else:
+        def loss_fn(images, prompts):
+            if images.min() < 0: # normalize unnormalized images
+                images = ((images / 2) + 0.5).clamp(0, 1)
+            scores = scorer(images, prompts, metadata=None)
+
+            loss = 1.0 - scores
+            return loss, scores
+
+        return loss_fn
+
+
+def ImageReward(dtype=torch.float32, device="cuda", accelerator=None):
+    
+    # def get_local_rank():
+    #     return int(os.environ.get('LOCAL_RANK', '0'))
+
+    # if get_local_rank() == 0:  # only download once
+    #     reward_model = RM.load("ImageReward-v1.0")
+
+    # dist.barrier()
+    reward_model = RM.load("ImageReward-v1.0")
+    reward_model.to(dtype).to(device)
+
+    rm_preprocess = Compose([
+            Resize(224, interpolation=BICUBIC),
+            CenterCrop(224),
+            Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+        ])
+
+    def _fn(images, prompts, meta=None):
+        dic = reward_model.blip.tokenizer(prompts,
+                padding='max_length', truncation=True,  return_tensors="pt",
+                max_length=reward_model.blip.tokenizer.model_max_length) # max_length=512
+        device = images.device
+        input_ids, attention_mask = dic.input_ids.to(device), dic.attention_mask.to(device)
+        reward = reward_model.score_gard(input_ids, attention_mask, rm_preprocess(images.to(dtype)))
+        reward = reward.reshape(images.shape[0]).float()  # bf16 -> f32
+        # reward = F.relu(reward)
+
+        # 4) loss = 1 - reward
+        loss = -1 * torch.nn.functional.relu(reward)
+
+        return reward, loss  # differentiable
+
+    return _fn
+
+
+def PickScore(
+    inference_dtype=None, 
+    device='cuda', 
+    return_loss=False, 
+):
+    from ddpo_pytorch.PickScore_scorer import PickScoreScorer
+
+    scorer = PickScoreScorer(dtype=torch.float32, device=device)
+    scorer.requires_grad_(False)
+
+    if not return_loss:
+        def _fn(images, prompts, metadata=None):
+            if images.min() < 0: # normalize unnormalized images
+                images = ((images / 2) + 0.5).clamp(0, 1)
+            scorer_ = scorer.to(dtype=inference_dtype).to(images.device)
+            scores = scorer_(images, prompts)
+            return scores, {}
+
+        return _fn
+
+    else:
+        def loss_fn(images, prompts, metadata=None):
+            if images.min() < 0: # normalize unnormalized images
+                images = ((images / 2) + 0.5).clamp(0, 1)
+            scores = scorer(images, prompts)
+
+            loss = - scores
+            return scores, loss
+
+        return loss_fn

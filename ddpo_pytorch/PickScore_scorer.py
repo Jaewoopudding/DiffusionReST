@@ -14,7 +14,7 @@ class PickScoreScorer(torch.nn.Module):
 
         checkpoint_path = "yuvalkirstain/PickScore_v1"
         # checkpoint_path = f"{os.path.expanduser('~')}/.cache/PickScore_v1"
-        self.model = AutoModel.from_pretrained(checkpoint_path).eval().to(self.device, dtype=self.dtype)
+        self.model = AutoModel.from_pretrained(checkpoint_path).eval()
 
         self.target_size =  224
         self.normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
@@ -27,7 +27,7 @@ class PickScoreScorer(torch.nn.Module):
             truncation=True,
             max_length=77,
             return_tensors="pt",
-        ).to(self.device)
+        ).to(images.device)
         text_embeds = self.model.get_text_features(**text_inputs)
         text_embeds = text_embeds / torch.norm(text_embeds, dim=-1, keepdim=True)
 

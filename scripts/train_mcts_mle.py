@@ -912,9 +912,9 @@ def main(_):
                 config.sample.batch_size, 1
             )  # (batch_size, num_steps)
             if config.train.kl_lagrangian_coef:
-                advantages = advantages / config.train.kl_lagrangian_coef
+                advantages = advantages.unsqueeze(0) / config.train.kl_lagrangian_coef
             else:
-                advantages = advantages * 0
+                advantages = advantages.unsqueeze(0) * 0
 
             rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
 

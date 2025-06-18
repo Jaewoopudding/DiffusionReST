@@ -19,6 +19,7 @@ class Node:
         self.log_prob = log_prob
         self.ref_log_prob = ref_log_prob
         self.gradient = None
+        self.value_estimation = 0
         
     def get_parent(self):
         return self.parent
@@ -113,6 +114,17 @@ class BatchedNode:
     @property
     def log_probs(self):
         return torch.stack([node.log_prob for node in self.node_list], dim=0)
+    
+    @property
+    def value_estimation(self):
+        return torch.stack([node.value_estimation for node in self.node_list], dim=0)
+    
+    @value_estimation.setter
+    def value_estimation(self, value_estimation):
+        # value_estimation: (B, ...) 텐서라고 가정
+        assert value_estimation.shape[0] == self.batch_size, "Batch size mismatch in value_estimation setter."
+        for i, node in enumerate(self.node_list):
+            node.value_estimation = value_estimation[i : i + 1]
     
     @log_probs.setter   
     def log_probs(self, new_log_probs):
@@ -413,6 +425,11 @@ class TreePolicy:
         image = self.pipeline.image_processor.postprocess(image, output_type="pt", do_denormalize=do_denormalize)
         evaluation, _ = self.reward_fn(image, self.prompt, self.prompt_metadata)
         batched_nodes.rewards = evaluation
+
+        step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
+        discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - timesteps) // step_offset - 1)
+        value_estimation = torch.nan_to_num(evaluation) / self.kl_lagrangian_coef * discount
+        batched_nodes.value_estimation = value_estimation
         return evaluation
         
     def backpropagate(self,  children):

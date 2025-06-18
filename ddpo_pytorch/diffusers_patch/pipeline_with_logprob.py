@@ -449,6 +449,7 @@ def tree_pipeline_with_logprob(
     prior = tree.select(tree.importance_sampling).states
     all_latents = []
     all_log_probs = []
+    all_value_estimations = [] 
     
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
     
@@ -461,6 +462,7 @@ def tree_pipeline_with_logprob(
             latents = tree.root_nodes.states
             
             all_latents.append(latents)
+            all_value_estimations.append(tree.root_nodes.value_estimation)
             if i > 0:
                 all_log_probs.append(tree.root_nodes.log_probs)
         
@@ -497,4 +499,7 @@ def tree_pipeline_with_logprob(
     if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
         self.final_offload_hook.offload()
 
-    return image, has_nsfw_concept, all_latents, all_log_probs, prior, tree
+    values = torch.cat(all_value_estimations).squeeze(-1) * config.search.kl_lagrangian_coef
+    advantages = config.search.gamma * values[1:] - values[:-1]
+
+    return image, has_nsfw_concept, all_latents, all_log_probs, advantages, prior, tree

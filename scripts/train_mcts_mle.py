@@ -386,6 +386,28 @@ class SearchDataset(torch.utils.data.Dataset):
         self.logger.info(f"Final sample count            : {total_kept}")
         self.logger.info("───────────────────────────────────────────────────────\n")
 
+def _cleanup_old_buffers(buffer_dir: str, current_epoch: int, world_size: int, logger):
+    """
+    on-policy 모드(off_policy_subset_size == 0)일 때,
+    이전 epoch(< current_epoch)의 데이터·메타 파일을 모두 삭제.
+    """
+    deleted = 0
+    for e in range(current_epoch):            # 0 .. current_epoch-1
+        for r in range(world_size):
+            for stem in (
+                f"epoch_{e}_rank_{r}.pt",         # data
+                f"meta_epoch_{e}_rank_{r}.pt",    # meta  ← NEW
+            ):
+                fpath = os.path.join(buffer_dir, stem)
+                try:
+                    os.remove(fpath)
+                    deleted += 1
+                except FileNotFoundError:
+                    continue
+
+    if deleted:
+        logger.info(f"[buffer-gc] removed {deleted} old buffer files")
+
 
 def generate_evaluation_samples(
     pipeline,
@@ -824,6 +846,7 @@ def main(_):
         eval_samples = []
         prompts = []
         images_list = []
+        advantages_list = []
         eval_images_list = []
         num_images_per_prompt = config.sample.num_batches_per_epoch // config.sample.num_prompts_per_batch
         
@@ -861,7 +884,7 @@ def main(_):
                 shape = (config.search.duplicate * config.search.nfe_per_action, 4, 64, 64)
                 init_latents = torch.randn(shape, device=accelerator.device)
                 pipeline.batch_size = 1
-                images, _, latents, log_probs, prior, tree = tree_pipeline_with_logprob(
+                images, _, latents, log_probs, advantages, prior, tree = tree_pipeline_with_logprob(
                     pipeline,
                     config=config,
                     reward_fn=reward_fn,
@@ -888,7 +911,10 @@ def main(_):
             timesteps = pipeline.scheduler.timesteps.repeat(
                 config.sample.batch_size, 1
             )  # (batch_size, num_steps)
-            
+            if config.train.kl_lagrangian_coef:
+                advantages = advantages / config.train.kl_lagrangian_coef
+            else:
+                advantages = advantages * 0
 
             rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
 
@@ -926,6 +952,7 @@ def main(_):
                     "final_embedding": latents[:, -1],
                     "tree": tree,
                     "image_embedding": embedded_images,
+                    "advantages": advantages,
                     "clip_scores": clip_scores,
                 }
             )
@@ -940,7 +967,7 @@ def main(_):
             rewards, reward_metadata = sample["rewards"].result()
             sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
             # eval_results = sample["evals"].result()
-            eval_results = {key: torch.as_tensor(value, device=accelerator.device) for key, value in sample.items() if key not in ["prompt_ids", "prompt_embeds", "timesteps", "latents", "next_latents", "log_probs", "rewards", "tree", "prompts"]}
+            eval_results = {key: torch.as_tensor(value, device=accelerator.device) for key, value in sample.items() if key not in ["prompt_ids", "prompt_embeds", "timesteps", "latents", "next_latents", "log_probs", "rewards", "tree", "advantages", "prompts"]}
             sample.update(eval_results)
             # del sample["evals"]
 
@@ -1105,18 +1132,18 @@ def main(_):
             advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
         # ungather advantages; we only need to keep the entries corresponding to the samples on this process
-        samples["advantages"] = (
-            torch.as_tensor(advantages)
-            .reshape(accelerator.num_processes, -1)[accelerator.process_index]
-            .to(accelerator.device)
-        )
+        # samples["advantages"] = (
+        #     torch.as_tensor(advantages)
+        #     .reshape(accelerator.num_processes, -1)[accelerator.process_index]
+        #     .to(accelerator.device)
+        # )
 
         # shuffle along time dimension independently for each sample
         total_batch_size, num_timesteps = samples["timesteps"].shape
         if config.multistep_mdp:
             perms = torch.stack([torch.randperm(num_timesteps, device=accelerator.device) for _ in range(total_batch_size)])
 
-            for key in ["timesteps", "latents", "next_latents", "log_probs", "eval_latents", "eval_next_latents", "eval_log_probs"]:
+            for key in ["timesteps", "latents", "next_latents", "log_probs", "eval_latents", "eval_next_latents", "eval_log_probs", "advantages"]:
                 samples[key] = samples[key][
                     torch.arange(total_batch_size, device=accelerator.device)[:, None],
                     perms,
@@ -1173,8 +1200,7 @@ def main(_):
         torch.save({
             "dataset": on_policy_dataset_per_gpu,
         }, buffer_path)
-
-
+        
         meta = {
             "prompts"        : [s["prompts"] for s in samples_batched_cpu],       # str list (길이 = B)
             "rewards"        : torch.stack([s["rewards"].cpu()        for s in samples_batched_cpu]),
@@ -1182,15 +1208,32 @@ def main(_):
             "image_embedding": torch.stack([s["image_embedding"].cpu() for s in samples_batched_cpu]),
         }
         torch.save(meta, meta_path)     #  buffer/meta_epoch_{E}_rank_{R}.pt  로 저장
+            
+        if dist.is_initialized():
+            accelerator.wait_for_everyone()    # 모든 rank 저장 끝날 때까지 대기
+
+        if accelerator.is_main_process and config.buffer.off_policy_subset_size == 0 and epoch > 0:
+            _cleanup_old_buffers(buffer_dir, epoch, world_size, logger)  # ← NEW!
 
         if dist.is_initialized():
-            accelerator.wait_for_everyone()
+            accelerator.wait_for_everyone()    # 삭제 끝나면 다시 동기화
 
         gathered_meta = {k: [] for k in meta}    # {prompts:[], rewards:[], …}
 
-        for e in range(epoch + 1):               # 0 ~ 현재 epoch
-            for r in range(world_size):          # rank 순회
-                m = torch.load(os.path.join(buffer_dir, f"meta_epoch_{e}_rank_{r}.pt"), map_location="cpu")
+        for e in range(epoch + 1):                      # 0 ~ current epoch
+            for r in range(world_size):
+                meta_path = os.path.join(buffer_dir, f"meta_epoch_{e}_rank_{r}.pt")
+                data_path = os.path.join(buffer_dir, f"epoch_{e}_rank_{r}.pt")
+
+                # ① 메타가 없으면 당연히 skip
+                if not os.path.exists(meta_path):
+                    continue
+                # ② 메타는 있는데 데이터가 없으면 skip  (※ NEW)
+                if not os.path.exists(data_path):
+                    logger.warning(f"[buffer] meta만 있고 data가 없어 건너뜀 → {meta_path}")
+                    continue
+
+                m = torch.load(meta_path, map_location="cpu")
                 for k in gathered_meta:
                     gathered_meta[k].append(m[k])
 
@@ -1334,6 +1377,7 @@ def main(_):
                                     latents = sample['latents'][:, j]
                                     timesteps = sample['timesteps'][:, j]
                                     next_latents = sample['next_latents'][:, j]
+                                    advantages = sample['advantages'][:, j]
                                     
                                     noise_pred = unet(torch.cat([latents] * 2),torch.cat([timesteps] * 2), embeds,).sample
                                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -1351,7 +1395,7 @@ def main(_):
                                         prev_sample=next_latents
                                     )
                                     
-                                loss = -search_log_prob
+                                loss = -torch.exp(advantages) * search_log_prob
                                 info["positive_loss"].append(loss.detach())
                                 accelerator.backward(loss)
                                 if (config.train.kl_coef) == 0 and (not config.train.negative_gradient) and (accelerator.sync_gradients):
@@ -1746,12 +1790,11 @@ def main(_):
             del eval_images_list
             del eval_rewards
             del eval_images_tensor
-            del gathered_meta
-            del buffers
-            
             gc.collect()
             torch.cuda.empty_cache()
 
+        del buffers
+        del gathered_meta
         del replaybuffer
         del dataloader    
         gc.collect()

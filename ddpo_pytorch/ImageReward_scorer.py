@@ -20,7 +20,6 @@ class MLP(nn.Module):
             nn.Linear(16, 1),
         )
 
-    @torch.no_grad()
     def forward(self, embed):
         return self.layers(embed)
 
@@ -46,9 +45,9 @@ class ImageRewardScorer(nn.Module):
         self.load_state_dict(state_dict, strict=False)
         self.eval()
 
-    @torch.no_grad()
     def __call__(self, images, prompts):
-        images = (images * 255).round().clamp(0, 255).to(torch.uint8)
+        breakpoint()
+        images = (images * 255).round().clamp(0, 255)
         inputs = self.processor(images=images, return_tensors="pt")
         inputs = {k: v.to(self.dtype).to(self.device) for k, v in inputs.items()}["pixel_values"]
         image_embeds = self.blip.visual_encoder(inputs)

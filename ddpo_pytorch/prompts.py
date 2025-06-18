@@ -34,7 +34,6 @@ def from_file_all(path, low=None, high=None):
 def imagenet_all():
     return from_file_all("imagenet_classes.txt")
 
-
 def imagenet_animals():
     return from_file_all("imagenet_classes.txt", 0, 398)
 
@@ -44,7 +43,6 @@ def imagenet_animals_all():
 def imagenet_dogs():
     return from_file_all("imagenet_classes.txt", 151, 269)
 
-
 def imagenet_rottweiler():
     return from_file_all("imagenet_classes.txt", 234, 235)
 
@@ -53,6 +51,9 @@ def simple_animals():
 
 def simple_animals_ddpo():
     return from_file("simple_animals.txt")
+
+def hps_eval():
+    return from_file_all("hps_v2_all_eval.txt")
 
 
 def nouns_activities(nouns_file, activities_file):

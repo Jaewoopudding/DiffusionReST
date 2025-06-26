@@ -632,7 +632,7 @@ def main(_):
 
                         # ppo logic
                         advantages = torch.clamp(
-                            torch.exp(sample["advantages"]),
+                            sample["advantages"],
                             -config.train.adv_clip_max,
                             config.train.adv_clip_max,
                         )
@@ -709,7 +709,7 @@ def main(_):
             )
             
             eval_images_tensor = torch.cat(eval_images_list)
-            save_dir = f'images/{config.run_name}'
+            save_dir = f'images/eval_{epoch}-improve_1/{config.run_name}'
             os.makedirs(save_dir, exist_ok=True) 
             for i, (image, prompt) in enumerate(zip(eval_images_tensor, prompts_total)):
                 pil = Image.fromarray(

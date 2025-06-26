@@ -20,6 +20,8 @@ class Node:
         self.ref_log_prob = ref_log_prob
         self.gradient = None
         self.value_estimation = 0
+        self.next_weighted_mean_states = None
+        self.mean_advantages = None
         
     def get_parent(self):
         return self.parent
@@ -130,8 +132,28 @@ class BatchedNode:
     def log_probs(self, new_log_probs):
         assert new_log_probs.shape[0] == self.batch_size, "Batch size mismatch in log_probs setter."
         for i, node in enumerate(self.node_list):
-            node.log_prob = new_log_probs[i : i + 1]    
-            
+            node.log_prob = new_log_probs[i : i + 1]   
+
+    @property
+    def next_weighted_mean_states(self):
+        return torch.stack([node.next_weighted_mean_states for node in self.node_list], dim=0)
+
+    @next_weighted_mean_states.setter
+    def next_weighted_mean_states(self, new_next_weighted_mean_states):
+        assert new_next_weighted_mean_states.shape[0] == self.batch_size, "Batch size mismatch in next_weighted_mean_states setter."
+        for i, node in enumerate(self.node_list):
+            node.next_weighted_mean_states = new_next_weighted_mean_states[i : i + 1]
+
+    @property
+    def mean_advantages(self):
+        return torch.stack([node.mean_advantages for node in self.node_list], dim=0)
+
+    @mean_advantages.setter
+    def mean_advantages(self, new_mean_advantages):
+        assert new_mean_advantages.shape[0] == self.batch_size, "Batch size mismatch in mean_advantages setter."
+        for i, node in enumerate(self.node_list):
+            node.mean_advantages = new_mean_advantages[i : i + 1]
+
     def get_children(self):
         return [node.get_children() for node in self.node_list]
     
@@ -200,6 +222,7 @@ class TreePolicy:
         node_list = [Node(state=None, timestep=None, parent=None, reward=None)]
         self.device = pipeline.device
         self.pipeline_config = config
+        self.search_train_kl_ratio = self.pipeline_config.search.kl_lagrangian_coef / self.pipeline_config.train.kl_lagrangian_coef
         
         self.prompt = prompt
         self.prompt_metadata = prompt_metadata
@@ -379,10 +402,10 @@ class TreePolicy:
             else:
                 nodes.add_children(new_latents.detach(), new_timesteps, log_probs.view(1, duplicate).detach())
 
-            for idx, nodes in enumerate(tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=2, disable=True)):
-                self.evaluate(BatchedNode(nodes))
-                self.backpropagate(nodes)
-
+            for idx, child_nodes in enumerate(tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=2, disable=True)):
+                self.evaluate(BatchedNode(child_nodes))
+                self.backpropagate(child_nodes)
+        self.get_advantage_weighted_next_states(nodes)
         del latent, old_noise_pred, model_output, noise_pred
         torch.cuda.empty_cache()
     
@@ -452,6 +475,25 @@ class TreePolicy:
             node.state = None
         node.children.clear()
         node.parent = None
+
+    def get_advantage_weighted_next_states(self, nodes):
+        current_values = nodes[0].value_estimation ## 0 for hard coding ## TODO to fix
+        child_values = []
+        child_states = []
+
+        for node in nodes:
+            children = node.get_children()
+            if children:
+                child_values.append(torch.tensor([child.value_estimation for child in children], dtype=torch.float32, device=self.device).squeeze())    
+                child_states.append(torch.stack([child.state for child in children]).squeeze())
+        
+        child_values = torch.cat(child_values, dim=0)
+        child_states = torch.cat(child_states, dim=0)
+
+        child_advantages = torch.exp((self.pipeline_config.search.gamma * child_values - current_values) * self.search_train_kl_ratio).clamp(min=1e-10, max=1e4)
+        normalized_child_advantages = child_advantages / child_advantages.sum(dim=0)
+        nodes.next_weighted_mean_states = (child_states * normalized_child_advantages.view(-1, 1, 1, 1)).sum(dim=0, keepdim=True)
+        nodes.mean_advantages = child_advantages.mean(dim=0).view(1, -1)
 
     def act_and_prune(self, select_fn, prune=True):
         selected_nodes = []

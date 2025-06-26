@@ -285,7 +285,7 @@ def tree_pipeline_with_logprob(
     guidance_rescale: float = 0.0,
     prompt_metadata: Optional[Dict[str, Any]] = None,
     prompts: Optional[List[str]] = None,
-    ref_unet: Callable = None,
+    ref_unet: Optional[Callable] = None,
 ):
     r"""
     Function invoked when calling the pipeline for generation.
@@ -450,6 +450,8 @@ def tree_pipeline_with_logprob(
     all_latents = []
     all_log_probs = []
     all_value_estimations = [] 
+    all_next_weighted_mean_states = []
+    all_mean_advantages = []
     
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
     
@@ -460,8 +462,9 @@ def tree_pipeline_with_logprob(
                 tree.expand(nodes=current_nodes, use_gradient=config.search.value_gradient, jump=False)    
             tree.act_and_prune(select_fn=tree.argmax_value, prune=False)  
             latents = tree.root_nodes.states
-            
             all_latents.append(latents)
+            all_next_weighted_mean_states.append(current_nodes.next_weighted_mean_states[0])
+            all_mean_advantages.append(current_nodes.mean_advantages)
             all_value_estimations.append(tree.root_nodes.value_estimation)
             if i > 0:
                 all_log_probs.append(tree.root_nodes.log_probs)
@@ -502,4 +505,4 @@ def tree_pipeline_with_logprob(
     values = torch.cat(all_value_estimations).squeeze(-1) * config.search.kl_lagrangian_coef
     advantages = config.search.gamma * values[1:] - values[:-1]
 
-    return image, has_nsfw_concept, all_latents, all_log_probs, advantages, prior, tree
+    return image, has_nsfw_concept, all_latents, all_log_probs, advantages, all_next_weighted_mean_states, all_mean_advantages, prior, tree

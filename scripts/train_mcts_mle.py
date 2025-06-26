@@ -1547,7 +1547,7 @@ def main(_):
                                         eta=config.sample.eta,
                                         prev_sample=next_latents
                                     )
-                                loss = -torch.exp(advantages).clamp(max=5.) * search_log_prob
+                                loss = -advantages.clamp(max=5.) * search_log_prob
                                 info["positive_loss"].append(loss.detach())
                                 accelerator.backward(loss)
                                 if (config.train.kl_coef) == 0 and (not config.train.negative_gradient) and (accelerator.sync_gradients):

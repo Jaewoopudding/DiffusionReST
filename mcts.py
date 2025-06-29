@@ -222,8 +222,11 @@ class TreePolicy:
         node_list = [Node(state=None, timestep=None, parent=None, reward=None)]
         self.device = pipeline.device
         self.pipeline_config = config
-        self.search_train_kl_ratio = self.pipeline_config.search.kl_lagrangian_coef / self.pipeline_config.train.kl_lagrangian_coef
-        
+        if self.pipeline_config.train.kl_lagrangian_coef != 0 :
+            self.search_train_kl_ratio = self.pipeline_config.search.kl_lagrangian_coef / self.pipeline_config.train.kl_lagrangian_coef
+        else:
+            self.search_train_kl_ratio = self.pipeline_config.search.kl_lagrangian_coef
+
         self.prompt = prompt
         self.prompt_metadata = prompt_metadata
         
@@ -344,9 +347,7 @@ class TreePolicy:
                 image = self.pipeline.image_processor.postprocess(image, output_type="pt", do_denormalize=do_denormalize)
                 
                 evaluation, _ = self.reward_fn(image, self.prompt, self.prompt_metadata)
-                evaluation = self.lookforward_fn(evaluation).to(torch.float32)
-                
-                guidance = torch.autograd.grad(outputs=evaluation, inputs=latent, grad_outputs=torch.ones_like(evaluation))[0].detach()
+                guidance = torch.autograd.grad(outputs=evaluation.to(torch.float32), inputs=latent, grad_outputs=torch.ones_like(evaluation))[0].detach() / self.pipeline_config.search.kl_lagrangian_coef
                 if torch.isnan(guidance).any():
                     guidance = torch.nan_to_num(guidance, nan=0)
                     evaluation = torch.nan_to_num(evaluation, nan=-1e6)

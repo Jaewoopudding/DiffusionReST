@@ -176,7 +176,8 @@ def PickScore(
         def _fn(images, prompts):
             if images.min() < 0: # normalize unnormalized images
                 images = ((images / 2) + 0.5).clamp(0, 1)
-            scores = scorer(images, prompts)
+            scorer_ = scorer.to(images.device)
+            scores = scorer_(images, prompts)
             return scores
 
         return _fn
@@ -185,7 +186,8 @@ def PickScore(
         def loss_fn(images, prompts):
             if images.min() < 0: # normalize unnormalized images
                 images = ((images / 2) + 0.5).clamp(0, 1)
-            scores = scorer(images, prompts)
+            scorer_ = scorer.to(images.device)
+            scores = scorer_(images, prompts)
 
             loss = - scores
             return loss, scores

@@ -921,7 +921,7 @@ def main(_):
             else:
                 advantages = advantages.unsqueeze(0) * 0
 
-            rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
+            rewards = executor.submit(reward_fn, images, prompt, prompt_metadata)
 
             time.sleep(0)
             

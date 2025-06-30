@@ -1,16 +1,16 @@
-CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --main_process_port 29501 scripts/sample.py \
 --config config/svdd_aesthetic_mle.py \
 --config.run_name pick_0.0005_4_0.9 \
 --config.train.learning_rate 2e-3 \
 --config.train.total_batch_size 64 \
 --config.train.gradient_steps_per_improve_step 500 \
 --config.train.improve_steps 1 \
---config.sample.num_batches_per_epoch 40 \
+--config.sample.num_batches_per_epoch 50 \
 --config.prompt_fn hps_eval \
 --config.train.kl_coef 0.01 \
 --config.train.type 'energy_based_negative_gradient' \
 --config.eval.num_images_per_prompt 8 \
---config.sample.num_prompts_per_batch 40 \
+--config.sample.num_prompts_per_batch 50 \
 --config.sample.num_steps 50 \
 --config.search.value_gradient \
 --config.reward_fn PickScore \
@@ -27,5 +27,5 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --main_process_port 29501 scripts
 --config.save_freq 1000 \
 --config.train.clip_range 0.0001 \
 --config.search.duplicate 4 \
---config.search.gamma 0.99 \
+--config.search.gamma 0.90 \
 --config.search.kl_lagrangian_coef 0.00005 \

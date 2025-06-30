@@ -1,0 +1,1034 @@
+from collections import defaultdict
+import contextlib
+import os
+import gc
+import datetime
+from concurrent import futures
+import time
+import random
+import itertools
+from absl import app, flags
+from ml_collections import config_flags
+import accelerate
+from accelerate import Accelerator
+from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.logging import get_logger
+from diffusers import StableDiffusionPipeline, DDIMScheduler, UNet2DConditionModel
+from diffusers.loaders import AttnProcsLayers
+from diffusers.models.attention_processor import LoRAAttnProcessor
+import numpy as np
+import torch.utils
+import torch.nn.functional as F
+import ddpo_pytorch.prompts
+import ddpo_pytorch.rewards
+from ddpo_pytorch.stat_tracking import PerPromptStatTracker
+from ddpo_pytorch.diffusers_patch.pipeline_with_logprob import tree_pipeline_with_logprob, pipeline_with_logprob
+from ddpo_pytorch.diffusers_patch.ddim_with_logprob import ddim_step_with_logprob
+import torch
+import wandb
+from functools import partial
+import tqdm
+import tempfile
+from PIL import Image
+from transformers import CLIPModel
+import torchvision
+from buffer import PrioritizedReplayBuffer
+import warnings
+import torch.distributed as dist
+from pathlib import Path
+import re 
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
+
+
+FLAGS = flags.FLAGS
+config_flags.DEFINE_config_file("config", "config/svdd_aesthetic_mle.py", "Training configuration.")
+
+logger = get_logger(__name__)
+
+
+from typing import Optional, Callable, Dict, Any, List, DefaultDict
+
+
+import psutil
+
+
+def cycle(iterable):
+    while True:
+        for x in iterable:
+            yield x
+
+
+def print_memory_usage():
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    rss = mem_info.rss / 1024**2  # Resident Set Size in MB
+    vms = mem_info.vms / 1024**2  # Virtual Memory Size in MB
+    print(f"[Memory] RSS: {rss:.2f} MB | VMS: {vms:.2f} MB")
+
+_CPU_PG = None          # lazy-init 한 번만
+
+def get_cpu_pg():
+    global _CPU_PG
+    if _CPU_PG is None:
+        # 기존 default(NCCL) 그룹은 건드리지 않고 새 그룹 생성
+        _CPU_PG = dist.new_group(backend="gloo")
+    return _CPU_PG
+
+
+def cpu_gather_object(obj):
+    if not dist.is_initialized():
+        return obj                     # single-process run
+
+    pg = get_cpu_pg()
+    world_size = dist.get_world_size(pg)
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, obj, group=pg)
+
+    flat = []
+    for g in gathered:
+        flat.extend(g if isinstance(g, list) else [g])
+    return flat
+
+
+
+def _split_dict_of_lists(d):
+    """
+    If d has values that are *all* list/tuple of equal length L,
+    turn it into a list[dict] of length L (one element per index).
+    Otherwise return [d] untouched.
+    """
+    list_keys = [k for k, v in d.items() if isinstance(v, (list, tuple))]
+    if not list_keys:
+        return [d]                      # nothing to split
+
+    L = len(d[list_keys[0]])
+    if not all(len(d[k]) == L for k in list_keys):
+        return [d]                      # inconsistent → leave as is
+
+    out = []
+    for i in range(L):
+        new_d = {}
+        for k, v in d.items():
+            new_d[k] = v[i] if isinstance(v, (list, tuple)) else v
+        out.append(new_d)
+    return out
+
+def collate_without_tree_prompt(batch):
+    """
+    batch : list[dict]  (각 dict 구조는
+            {'prompt_embeds', 'timesteps', 'latents', ... , 'trees', 'prompts'})
+
+    returns: dict  (same keys; 'trees'·'prompts' 값은 list, 나머지는 batched tensor/array)
+    """
+    merged = defaultdict(list)
+    for sample in batch:
+        for k, v in sample.items():
+            merged[k].append(v)
+
+    out = {}
+    for k, vlist in merged.items():
+        if k in ("trees", "prompts"):
+            out[k] = vlist
+        else:
+            v0 = vlist[0]
+            if torch.is_tensor(v0):
+                out[k] = torch.cat(vlist, dim=0)
+            elif isinstance(v0, np.ndarray):
+                out[k] = np.cat(vlist, axis=0)
+            else:
+                out[k] = vlist
+    return out
+    
+
+def _flatten_gathered(obj_list):
+    """
+    • unravel nested lists from gather_object  
+    • split dict-of-lists into list-of-dicts
+    """
+    flat = []
+    stack = list(obj_list)              # shallow copy
+    while stack:
+        itm = stack.pop()
+        if isinstance(itm, list):
+            stack.extend(itm)           # flatten one level
+        elif isinstance(itm, dict):
+            flat.extend(_split_dict_of_lists(itm))
+        else:
+            raise TypeError(f"Unexpected type from gather_object: {type(itm)}")
+    return flat
+
+
+class SearchDataset(torch.utils.data.Dataset):
+    """
+    데이터는 (1) buffer/epoch_{E}_rank_{R}.pt 에 저장된 샘플 리스트
+            (2) meta_epoch_{E}_rank_{R}.pt 에 저장된 메타-정보
+    두 파일의 *순서가 동일* 하다는 가정하에 lazy-loading 으로 동작한다.
+    """
+
+    _FILE_RGX = re.compile(r"epoch_(\d+)_rank_(\d+)\.pt")
+
+    # ─────────────────────────────────── init ─────────────────────────────────
+    def __init__(
+        self,
+        metadata: Dict[str, List],        # gathered_meta   (length = N_total)
+        buffer_path: str | Path,          # "buffer" 디렉터리
+        logger,
+        epoch: int,
+        *,
+        per_prompt_filtering_flag: bool = True,
+        per_prompt_select_flag: bool = False,
+        filtering_criteria: Dict[str, float] = None,
+        off_policy_subset_size: int = 0,
+        batch_size_subset: int = 1024,
+        verbose: bool = True,
+    ):
+        self.logger = logger
+        self.per_prompt_filtering_flag = per_prompt_filtering_flag
+        self.per_prompt_select_flag   = per_prompt_select_flag
+        self.filtering_criteria       = filtering_criteria or {}
+        self.off_policy_subset_size   = off_policy_subset_size
+        self.batch_size_subset        = batch_size_subset
+
+        # -------------------------- 0. 메타 정보 ------------------------------
+        self.meta = metadata                    # {prompts, rewards, clip_scores, image_embedding}
+        N = len(self.meta["prompts"])
+        assert all(len(v) == N for v in self.meta.values()), "메타 각 항목 길이가 다름"
+
+        # -------------------------- 1. 인덱스 매핑 ----------------------------
+        #   global idx  →  (epoch, rank, local_idx)
+        #   파일별 샘플 수는 한번만 읽어 길이를 캐시
+        self.buffer_root = Path(buffer_path)
+        self._file_len_cache: Dict[tuple[int,int], int] = {}
+        self._file_data_cache: Dict[tuple[int,int], List[dict]] = {}
+        self.current_epoch = epoch
+
+        # gather order와 동일한 (epoch,rank) 순으로 mapping 을 만든다
+        index_map: list[tuple[int,int,int]] = []
+        cursor = 0
+        for meta_file in sorted(self.buffer_root.glob("meta_epoch_*_rank_*.pt"),
+                                key=lambda p: (int(p.stem.split("_")[2]), int(p.stem.split("_")[-1]))):
+            m = self._FILE_RGX.search(meta_file.name)
+            epoch, rank = int(m.group(1)), int(m.group(2))
+            ds_file = self.buffer_root / f"epoch_{epoch}_rank_{rank}.pt"
+            # 샘플 수(cache)
+            if (epoch, rank) not in self._file_len_cache:
+                self._file_len_cache[(epoch, rank)] = len(torch.load(ds_file, map_location="cpu")["dataset"])
+            L = self._file_len_cache[(epoch, rank)]
+            for i in range(L):
+                index_map.append((epoch, rank, i))
+                cursor += 1
+        
+        assert cursor == N, "메타 길이와 실제 파일의 샘플 수가 불일치합니다."
+
+        self._index_map = index_map                         # 전체 길이 = N
+
+        # -------------------------- 2. Threshold 계산 -------------------------
+        self._compute_and_apply_filter(verbose)
+        
+        
+        self._calculate_prompts_stats()          # kept-샘플 통계 만들기
+        if verbose:
+            self.report_dataset_stats()          # 화면에 보기 좋게 출력
+
+    # ──────────────────────── helper : threshold & filter ────────────────────
+    def _compute_and_apply_filter(self, verbose: bool):
+        """self.meta 로부터 threshold 계산 & self._kept_idx 생성"""
+        rewards     = np.asarray(self.meta["rewards"],     dtype=float)
+        clip_scores = np.asarray(self.meta["clip_scores"], dtype=float)
+        prompts     = np.asarray(self.meta["prompts"])
+
+        # 1) thresholds -------------------------------------------------------
+        th = {}
+        if "rewards" in self.filtering_criteria:
+            q = self.filtering_criteria["rewards"]
+            th["rewards_glob"] = np.quantile(rewards, q)
+        if "clip_scores" in self.filtering_criteria:
+            q = self.filtering_criteria["clip_scores"]
+            th["clip_glob"] = np.quantile(clip_scores, q)
+
+        if self.per_prompt_filtering_flag:
+            th_per = defaultdict(dict)
+            for p in np.unique(prompts):
+                mask = prompts == p
+                if "rewards" in self.filtering_criteria:
+                    th_per[p]["rewards"] = np.quantile(rewards[mask], self.filtering_criteria["rewards"])
+                if "clip_scores" in self.filtering_criteria:
+                    th_per[p]["clip_scores"] = np.quantile(clip_scores[mask], self.filtering_criteria["clip_scores"])
+            self.th_global, self.th_per_prompt = None, th_per
+        else:
+            self.th_global, self.th_per_prompt = {k.split("_")[0]:v for k,v in th.items()}, None
+
+        # 2) filter -----------------------------------------------------------
+        all_kept = [i for i in range(len(prompts)) if self._pass_filter(i)]
+        kept_on  = [i for i in all_kept if self._epoch_of_idx(i) == self.current_epoch]
+        kept_off = [i for i in all_kept if self._epoch_of_idx(i) <  self.current_epoch]
+
+        if self.off_policy_subset_size and len(kept_off) > self.off_policy_subset_size:
+            kept_off = random.sample(kept_off, self.off_policy_subset_size)
+        if self.off_policy_subset_size == 0:
+            kept_off.clear()
+        
+        
+        self._kept_idx = kept_on + kept_off
+
+        if verbose:
+            self.logger.info(f"SearchDataset | kept {len(self._kept_idx):,} / {len(self.meta['prompts']):,}")
+            
+    def _epoch_of_idx(self, meta_idx: int) -> int:
+        epoch, _, _ = self._index_map[meta_idx]
+        return epoch
+
+    # ――― filtering helper
+    def _pass_filter(self, meta_idx: int) -> bool:
+        p   = self.meta["prompts"][meta_idx]
+        rew = float(self.meta["rewards"][meta_idx])
+        clip= float(self.meta["clip_scores"][meta_idx])
+
+        if self.th_per_prompt is not None:
+            th = self.th_per_prompt[p]
+        else:
+            th = self.th_global
+
+        if "rewards" in th and rew < th["rewards"]:
+            return False
+        if "clip_scores" in th and clip < th["clip_scores"]:
+            return False
+        return True
+
+    # ――― fetch meta as dict
+    def _meta_at(self, idx:int)->Dict:
+        return {k: self.meta[k][idx] for k in self.meta}
+
+    # ――― 다양도 선택 (메타만 사용, anchors==candidates 인 경우가 대부분)
+    def _select_diverse_candidates_meta(self, anchors_meta, cand_meta, J:int):
+        if J==0: return list(range(len(cand_meta)))
+        A_emb = torch.stack([m["image_embedding"] for m in anchors_meta])  # [A,D]
+        C_emb = torch.stack([m["image_embedding"] for m in cand_meta])     # [C,D]
+
+        A_emb = F.normalize(A_emb.flatten(1), dim=1)
+        C_emb = F.normalize(C_emb.flatten(1), dim=1)
+
+        if len(anchors_meta):
+            init_sim = C_emb @ A_emb.T
+            min_dist = 1 - init_sim.max(dim=1).values
+        else:
+            min_dist = torch.ones(len(cand_meta))
+
+        picked = []
+        for _ in range(min(J, len(cand_meta))):
+            pick = torch.argmax(min_dist).item()
+            picked.append(pick)
+            dist_new = 1 - (C_emb @ C_emb[pick:pick+1].T).squeeze(1)
+            min_dist = torch.minimum(min_dist, dist_new)
+            min_dist[pick] = -float("inf")
+        return picked
+
+    # ───────────────────────────── Dataset API ───────────────────────────────
+    def __len__(self):
+        return len(self._kept_idx)
+
+    def __getitem__(self, idx:int):
+        """idx → 실제 샘플(dict).  디스크에서 읽고 메모리 캐시에 올린다."""
+        real_idx = self._kept_idx[idx]
+        epoch, rank, local_idx = self._index_map[real_idx]
+
+        # 1) 파일 cache 로드
+        key = (epoch, rank)
+        if key not in self._file_data_cache:
+            file_path = self.buffer_root / f"epoch_{epoch}_rank_{rank}.pt"
+            self._file_data_cache[key] = torch.load(file_path, map_location="cpu")["dataset"]
+        sample = self._file_data_cache[key][local_idx]
+
+        return sample
+    
+    def _calculate_prompts_stats(self):
+        self.prompts_stats = defaultdict(lambda: {"rewards": [], "clip": [], "n": 0})
+
+        for idx in self._kept_idx:
+            p = self.meta["prompts"][idx]
+            r = float(self.meta["rewards"][idx])
+            c = float(self.meta["clip_scores"][idx])
+
+            st = self.prompts_stats[p]
+            st["rewards"].append(r)
+            st["clip"].append(c)
+            st["n"] += 1
+
+
+    def report_dataset_stats(self):
+        self.logger.info("")
+        self.logger.info("────────────────── Dataset summary ────────────────────")
+        total_kept = len(self._kept_idx)
+
+        for p, st in self.prompts_stats.items():
+            mean_r = np.nanmean(st["rewards"])
+            mean_c = np.nanmean(st["clip"])
+            n      = st["n"]
+
+            # prompt 별 threshold 문자열
+            th = self.th_per_prompt[p] if self.th_per_prompt else self.th_global
+            th_str = ", ".join(f"{k} ≥ {v:.4f}" for k, v in th.items())
+
+            self.logger.info(
+                f"{p[:36]:<36} | R={mean_r:5.3f} | clip={mean_c:5.3f} "
+                f"| n={n:4d} | threshold: {th_str}"
+            )
+
+        self.logger.info("")
+        self.logger.info(f"Filtering criteria (quantile) : {self.filtering_criteria}")
+        self.logger.info(f"Final sample count            : {total_kept}")
+        self.logger.info("───────────────────────────────────────────────────────\n")
+
+def _cleanup_old_buffers(buffer_dir: str, current_epoch: int, world_size: int, logger):
+    """
+    on-policy 모드(off_policy_subset_size == 0)일 때,
+    이전 epoch(< current_epoch)의 데이터·메타 파일을 모두 삭제.
+    """
+    deleted = 0
+    for e in range(current_epoch):            # 0 .. current_epoch-1
+        for r in range(world_size):
+            for stem in (
+                f"epoch_{e}_rank_{r}.pt",         # data
+                f"meta_epoch_{e}_rank_{r}.pt",    # meta  ← NEW
+            ):
+                fpath = os.path.join(buffer_dir, stem)
+                try:
+                    os.remove(fpath)
+                    deleted += 1
+                except FileNotFoundError:
+                    continue
+
+    if deleted:
+        logger.info(f"[buffer-gc] removed {deleted} old buffer files")
+
+
+def generate_evaluation_samples(
+    pipeline,
+    sample_neg_prompt_embeds,
+    config,
+    accelerator,
+    epoch,
+    reward_fn,
+    executor,
+    prompts_history,
+    prompts_metadata_history,
+    prior_history,
+    autocast,
+    num_images_per_prompt: int=None
+):
+    """
+    평가용 이미지를 생성하고, log_prob와 reward를 계산하여 eval_samples와 eval_images_list를 반환하는 함수입니다.
+    """
+    eval_images_list = []
+    eval_samples = []
+    eval_rewards_list = []
+    
+    # 평가용 이미지 및 log_prob 샘플링
+    for i in tqdm(
+        range(config.sample.num_batches_per_epoch) if num_images_per_prompt is None else range(len(prompts_history) * num_images_per_prompt),
+        desc=f"Epoch {epoch}: sampling for evaluation",
+        disable=not accelerator.is_local_main_process,
+        position=0,
+    ):
+        prompt_ids = pipeline.tokenizer(
+            prompts_history[i % len(prompts_history)],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=pipeline.tokenizer.model_max_length,
+        ).input_ids.to(accelerator.device)
+        prompt_embeds = pipeline.text_encoder(prompt_ids)[0]
+        
+        with autocast():
+            eval_images, _, eval_latents, eval_log_probs = pipeline_with_logprob(
+                pipeline,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=sample_neg_prompt_embeds,
+                num_inference_steps=config.sample.num_steps,
+                guidance_scale=config.sample.guidance_scale,
+                eta=config.sample.eta,
+                output_type="pt",
+                latents=prior_history[i % len(prompts_history)]
+            )
+            eval_images_list.append(eval_images)
+        
+        eval_latents = torch.stack(eval_latents, dim=1)
+        eval_log_probs = torch.stack(eval_log_probs, dim=1)
+
+        # reward를 비동기로 계산
+        eval_rewards_future = executor.submit(reward_fn, eval_images, prompts_history[i % len(prompts_history)], prompts_metadata_history[i % len(prompts_history)])
+        time.sleep(0)  # 비동기 호출이 시작될 시간을 주기 위함
+        timesteps = pipeline.scheduler.timesteps.repeat(
+            config.sample.batch_size, 1
+        )
+        eval_samples.append(
+            {
+                "prompt_ids": prompt_ids,
+                "prompt_embeds": prompt_embeds,
+                "timesteps": timesteps,
+                "latents": eval_latents[:, :-1],   # 각 timestep 이전의 latent
+                "next_latents": eval_latents[:, 1:], # 각 timestep 이후의 latent
+                "log_probs": eval_log_probs,
+                "eval_rewards": eval_rewards_future,
+            }
+        )
+    
+    for sample in tqdm(
+        eval_samples,
+        desc="Waiting for rewards",
+        disable=not accelerator.is_local_main_process,
+        position=0,
+    ):
+        eval_rewards, _ = sample["eval_rewards"].result()
+        sample["eval_rewards"] = torch.as_tensor(eval_rewards, device=accelerator.device)
+        eval_rewards_list.append(sample["eval_rewards"])
+        eval_results = {
+            key: torch.as_tensor(value, device=accelerator.device)
+            for key, value in sample.items()
+            if key not in ["prompt_ids", "prompt_embeds", "timesteps", "latents", "next_latents", "log_probs", "rewards"]
+        }
+        sample.update(eval_results)
+
+    eval_samples_collated = {
+        k: torch.cat([
+            torch.as_tensor(s[k], device=accelerator.device) if isinstance(s[k], np.ndarray) else s[k]
+            for s in eval_samples
+        ])
+        for k in eval_samples[0].keys()
+    }
+
+    return eval_samples_collated, eval_images_list, torch.cat(eval_rewards_list)
+
+
+def main(_):
+    # basic Accelerate and logging setup
+    config = FLAGS.config
+
+    # number of timesteps within each trajectory to train on
+    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
+    
+    
+    config.run_name = (
+        f'{config.reward_fn}'
+        f'_B={config.sample.batch_size * config.sample.num_batches_per_epoch * torch.cuda.device_count()}'
+        f'_M={config.search.duplicate}'
+        f'_KL={config.train.kl_coef}'
+        f'_G={config.search.value_gradient}:{config.search.kl_lagrangian_coef}'
+        f'_{datetime.datetime.now().strftime("%Y.%m.%d")}'
+        f'_{config.run_name}'
+    )
+    
+    if os.path.exists(os.path.join(config.logdir, config.run_name)):
+        for idx in itertools.count(1):
+            candidate = f"{config.run_name}_{idx}"
+            if not os.path.exists(os.path.join(config.logdir, candidate)):
+                config.run_name = candidate
+                break
+
+    accelerator_config = ProjectConfiguration(
+        project_dir=os.path.join(config.logdir, config.run_name),
+        automatic_checkpoint_naming=True,
+        total_limit=config.num_checkpoint_limit,
+    )
+    
+    def _strip_unpicklable(samples):
+        """
+        deep-copy 없이 가볍게:  각 샘플 dict에서 'trees' 키를 지운 새 dict 반환
+        """
+        cleaned = []
+        for s in samples:
+            d = dict(s)          # 얕은 복사
+            cleaned.append(d)
+        return cleaned
+    
+
+    if config.resume_from:
+        config.resume_from = os.path.normpath(os.path.expanduser(config.resume_from))
+        if "checkpoint_" not in os.path.basename(config.resume_from):
+            # get the most recent checkpoint in this directory
+            checkpoints = list(
+                filter(lambda x: "checkpoint_" in x, os.listdir(config.resume_from))
+            )
+            if len(checkpoints) == 0:
+                raise ValueError(f"No checkpoints found in {config.resume_from}")
+            config.resume_from = os.path.join(
+                config.resume_from,
+                sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
+            )
+
+    if config.multistep_mdp:
+        if config.train.type == 'energy_based_negative_gradient':
+            accumulation_steps = num_train_timesteps
+            if config.train.kl_coef > 0:
+                accumulation_steps += num_train_timesteps
+            if config.train.negative_gradient:
+                accumulation_steps += num_train_timesteps
+        else:
+            accumulation_steps = num_train_timesteps
+    else:
+        accumulation_steps = int(config.train.total_batch_size / (torch.cuda.device_count()))
+        
+    from accelerate.utils import GradientAccumulationPlugin
+    plugin = GradientAccumulationPlugin(num_steps=accumulation_steps * config.train.accumulation_multipler, sync_with_dataloader=False)
+    accelerator = Accelerator(
+        log_with="wandb",
+        mixed_precision=config.mixed_precision,
+        project_config=accelerator_config,
+        # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
+        # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
+        # the total number of optimizer steps to accumulate across.
+        # gradient_accumulation_steps=accumulation_steps, # int(config.train.total_batch_size / (torch.cuda.device_count()))
+        gradient_accumulation_plugin=plugin
+    )
+    
+    if accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name="ddpo-pytorch",
+            config=config.to_dict(),
+            init_kwargs={
+                "wandb": 
+                {
+                    "name": config.run_name,
+                    "entity": "gda-for-orl",
+                }
+            },
+        )
+    logger.info(f"\n{config}")
+
+
+
+    # set seed (device_specific is very important to get different prompts on different devices)
+    set_seed(config.seed, device_specific=True)
+
+    # load scheduler, tokenizer and models.
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        config.pretrained.model, revision=config.pretrained.revision
+    )
+    # freeze parameters of models to save more memory
+    pipeline.vae.requires_grad_(False)
+    pipeline.text_encoder.requires_grad_(False)
+    pipeline.unet.requires_grad_(not config.use_lora)
+    # disable safety checker
+    pipeline.safety_checker = None
+    # make the progress bar nicer
+    pipeline.set_progress_bar_config(
+        position=1,
+        disable=not accelerator.is_local_main_process,
+        leave=False,
+        desc="Timestep",
+        dynamic_ncols=True,
+    )
+    # switch to DDIM scheduler
+    pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
+
+    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not re ired.
+    inference_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        inference_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        inference_dtype = torch.bfloat16
+
+    # Move unet, vae and text_encoder to device and cast to inference_dtype
+    pipeline.vae.to(accelerator.device, dtype=inference_dtype)
+    pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
+    if config.use_lora:
+        pipeline.unet.to(accelerator.device, dtype=inference_dtype)
+
+    if config.use_lora:
+        # Set correct lora layers
+        lora_attn_procs = {}
+        for name in pipeline.unet.attn_processors.keys():
+            cross_attention_dim = (
+                None
+                if name.endswith("attn1.processor")
+                else pipeline.unet.config.cross_attention_dim
+            )
+            if name.startswith("mid_block"):
+                hidden_size = pipeline.unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(pipeline.unet.config.block_out_channels))[
+                    block_id
+                ]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = pipeline.unet.config.block_out_channels[block_id]
+
+            lora_attn_procs[name] = LoRAAttnProcessor(
+                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
+            )
+        pipeline.unet.set_attn_processor(lora_attn_procs)
+
+        # this is a hack to synchronize gradients properly. the module that registers the parameters we care about (in
+        # this case, AttnProcsLayers) needs to also be used for the forward pass. AttnProcsLayers doesn't have a
+        # `forward` method, so we wrap it to add one and capture the rest of the unet parameters using a closure.
+        class _Wrapper(AttnProcsLayers):
+            def forward(self, *args, **kwargs):
+                return pipeline.unet(*args, **kwargs)
+
+        unet = _Wrapper(pipeline.unet.attn_processors)
+    else:
+        unet = pipeline.unet
+
+    
+    
+    # set up diffusers-friendly checkpoint saving with Accelerate
+
+    def save_model_hook(models, weights, output_dir):
+        # assert len(models) == 1
+        try:
+            if config.use_lora and isinstance(models[0], AttnProcsLayers):
+                pipeline.unet.save_attn_procs(output_dir)
+            elif not config.use_lora and isinstance(models[0], UNet2DConditionModel):
+                models[0].save_pretrained(os.path.join(output_dir, "unet"))
+            else:
+                raise ValueError(f"Unknown model type {type(models[0])}")
+            weights.pop()  # ensures that accelerate doesn't try to handle saving of the model
+        except:
+            print("Error occurred while saving model")
+
+    def load_model_hook(models, input_dir):
+        # assert len(models) == 1
+        if config.use_lora and isinstance(models[0], AttnProcsLayers):
+            # pipeline.unet.load_attn_procs(input_dir)
+            tmp_unet = UNet2DConditionModel.from_pretrained(
+                config.pretrained.model,
+                revision=config.pretrained.revision,
+                subfolder="unet",
+            )
+            tmp_unet.load_attn_procs(input_dir)
+            models[0].load_state_dict(
+                AttnProcsLayers(tmp_unet.attn_processors).state_dict()
+            )
+            del tmp_unet
+        elif not config.use_lora and isinstance(models[0], UNet2DConditionModel):
+            load_model = UNet2DConditionModel.from_pretrained(
+                input_dir, subfolder="unet"
+            )
+            models[0].register_to_config(**load_model.config)
+            models[0].load_state_dict(load_model.state_dict())
+            del load_model
+        else:
+            raise ValueError(f"Unknown model type {type(models[0])}")
+        models.pop()  # ensures that accelerate doesn't try to handle loading of the model
+
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
+    
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    
+    # Enable TF32 for faster training on Ampere GPUs,
+    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+    if config.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    optimizer_cls = torch.optim.AdamW
+
+    optimizer = optimizer_cls(
+        unet.parameters(),
+        lr=config.train.learning_rate,
+        betas=(config.train.adam_beta1, config.train.adam_beta2),
+        weight_decay=config.train.adam_weight_decay,
+        eps=config.train.adam_epsilon,
+    )
+
+    # prepare prompt and reward fn
+    prompt_fn = getattr(ddpo_pytorch.prompts, config.prompt_fn)
+    prompts_total, prompt_metadata = prompt_fn(**config.prompt_fn_kwargs)
+    num_prompts = len(prompts_total)
+    
+    prior_total_for_eval = [torch.randn(config.sample.batch_size, 4, 64, 64).to(accelerator.device) * pipeline.scheduler.init_noise_sigma for _ in range(len(prompts_total))]
+    prompt_metadata_total_for_eval = [{} for _ in range(len(prompts_total))] 
+    
+    # if "aesthetic" in config.reward_fn :
+    #     reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)(torch_dtype=inference_dtype)
+    # else:
+    #     reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)()
+    # eval_fn = getattr(ddpo_pytorch.rewards, config.eval_fn)()
+    reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)()
+    # generate negative prompt embeddings
+    neg_prompt_embed = pipeline.text_encoder(
+        pipeline.tokenizer(
+            [""],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=pipeline.tokenizer.model_max_length,
+        ).input_ids.to(accelerator.device)
+    )[0]
+    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.batch_size, 1, 1)
+    train_neg_prompt_embeds = neg_prompt_embed.repeat(config.train.batch_size, 1, 1)
+
+    # initialize stat tracker
+    if config.per_prompt_stat_tracking:
+        stat_tracker = PerPromptStatTracker(
+            config.per_prompt_stat_tracking.buffer_size,
+            config.per_prompt_stat_tracking.min_count,
+        )
+
+    # for some reason, autocast is necessary for non-lora training but for lora training it isn't necessary and it uses
+    # more memory
+    autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
+    # autocast = accelerator.autocast
+
+    resizer = torchvision.transforms.Resize(224)
+    normalizer = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+    
+
+    unet_pretrained = UNet2DConditionModel.from_pretrained(
+        config.pretrained.model,
+        revision=config.pretrained.revision,
+        subfolder="unet",
+    ).to(accelerator.device, dtype=inference_dtype)
+    
+    # Prepare everything with our `accelerator`.
+    unet, optimizer, unet_pretrained = accelerator.prepare(unet, optimizer, unet_pretrained)
+
+        
+
+    # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
+    # remote server running llava inference.
+    executor = futures.ThreadPoolExecutor(max_workers=2)
+
+    # Train!
+    samples_per_epoch = (
+        config.sample.batch_size
+        * accelerator.num_processes
+        * config.sample.num_batches_per_epoch
+    )
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num Epochs = {config.num_epochs}")
+    logger.info(f"  Sample batch size per device = {config.sample.batch_size}")
+    logger.info(f"  Train batch size per device = {config.train.batch_size}")
+    logger.info("")
+    logger.info(f"  Gradient steps per single improve step = {config.train.gradient_steps_per_improve_step}")
+    logger.info(f"  Total number of samples per grow step = {samples_per_epoch}")
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {config.train.total_batch_size}"
+    )
+    logger.info(f"  Number of improve steps per grow step = {config.train.improve_steps}")
+    logger.info(f"  Frequency for save = {config.save_freq}")
+    logger.info(f"  Kullback-Liebler divergence coefficient = {config.train.kl_coef}")
+
+    assert config.sample.batch_size >= config.train.batch_size
+    assert config.sample.batch_size % config.train.batch_size == 0
+    # assert config.train.total_batch_size % accelerator.num_processes == 0
+    # assert config.eval.num_images_per_prompt % accelerator.num_processes == 0, "eval.num_prompts_per_batch must be devided  for now"
+
+
+    if config.resume_from:
+        logger.info(f"Resuming from {config.resume_from}")
+        accelerator.load_state(config.resume_from)
+        first_epoch = int(config.resume_from.split("_")[-1]) + 1
+    else:
+        first_epoch = 0
+
+    
+    global_step = 0
+    
+    
+    for epoch in range(first_epoch, config.num_epochs):
+        #################### SAMPLING ####################
+        on_policy_dataset_per_gpu = []
+        buffers = [PrioritizedReplayBuffer(capacity=10000, priority="rewards") for _ in range(num_prompts)]
+        pipeline.unet.eval()
+        samples = []
+        eval_samples = []
+        prompts = []
+        images_list = []
+        advantages_list = []
+        next_weighted_mean_states_list = []
+        eval_images_list = []
+        num_images_per_prompt = config.sample.num_batches_per_epoch // config.sample.num_prompts_per_batch
+        
+        prompts_history = []
+        prompts_metadata_history = []
+        prior_history = []
+        mean_advantages_list = []
+        
+        idxs = np.random.choice(num_prompts, size=config.sample.num_prompts_per_batch, replace=False).tolist()
+        prompts = [prompts_total[i] for i in idxs]  
+
+        image_embedder = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+        image_embedder.to(accelerator.device, dtype=inference_dtype)
+        
+        
+        for i in tqdm(
+            range(config.sample.num_batches_per_epoch),
+            desc=f"Epoch {epoch}: sampling",
+            disable=not accelerator.is_local_main_process,
+            position=0,
+        ):
+            prompt = prompts[i // num_images_per_prompt]
+            
+            # encode prompts
+            prompt_ids = pipeline.tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=pipeline.tokenizer.model_max_length,
+            ).input_ids.to(accelerator.device)
+            prompt_embeds = pipeline.text_encoder(prompt_ids)[0]
+
+            # sample
+            with autocast():
+                shape = (config.search.duplicate * config.search.nfe_per_action, 4, 64, 64)
+                init_latents = torch.randn(shape, device=accelerator.device)
+                pipeline.batch_size = 1
+                images, _, latents, log_probs, advantages, next_weighted_mean_states, mean_advantages, prior, _ = tree_pipeline_with_logprob(
+                    pipeline,
+                    config=config,
+                    reward_fn=reward_fn,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=sample_neg_prompt_embeds,
+                    num_inference_steps=config.sample.num_steps,
+                    guidance_scale=config.sample.guidance_scale,
+                    eta=config.sample.eta,
+                    output_type="pt",
+                    latents=init_latents,
+                    prompts=prompt,
+                    prompt_metadata=prompt_metadata,
+                    ref_unet = unet_pretrained if config.search.importance_sampling else None,
+                )
+                images_list.append(images)
+                prior_history.append(prior)
+                prompts_history.append(prompt)
+                mean_advantages_list.append(mean_advantages)
+                prompts_metadata_history.append(prompt_metadata)
+                next_weighted_mean_states_list.append(next_weighted_mean_states)
+
+            latents = torch.stack(
+                latents, dim=1
+            )  # (batch_size, num_steps + 1, 4, 64, 64)
+            next_weighted_mean_states = torch.stack(next_weighted_mean_states_list[0], dim=1)
+            log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
+            mean_advantages = torch.stack(mean_advantages_list[0]).view(1, -1)
+            timesteps = pipeline.scheduler.timesteps.repeat(
+                config.sample.batch_size, 1
+            )  # (batch_size, num_steps)
+            if config.train.kl_lagrangian_coef:
+                advantages = advantages.unsqueeze(0) / config.train.kl_lagrangian_coef
+            else:
+                advantages = advantages.unsqueeze(0) * 0
+
+            rewards = executor.submit(reward_fn, images, prompt, prompt_metadata)
+
+            time.sleep(0)
+            
+            processed_images = normalizer(resizer(images)).to(inference_dtype)
+            with torch.no_grad():
+                if isinstance(image_embedder, torch.nn.parallel.distributed.DistributedDataParallel):
+                    embedded_images = image_embedder.module.get_image_features(pixel_values=processed_images)
+                    embedded_prompts = image_embedder.module.get_text_features(input_ids=prompt_ids)   
+                else:
+                    embedded_images = image_embedder.get_image_features(pixel_values=processed_images)  
+                    embedded_prompts = image_embedder.get_text_features(input_ids=prompt_ids)
+            embedded_images = (embedded_images / torch.norm(embedded_images, dim=-1, keepdim=True)).detach()
+            embedded_prompts = (embedded_prompts / torch.norm(embedded_prompts, dim=-1, keepdim=True)).detach()
+            logits_per_image = embedded_images @ embedded_prompts.T
+            clip_scores = torch.diagonal(logits_per_image)
+        
+
+            samples.append(
+                {
+                    "prompts": prompt,
+                    "prompt_ids": prompt_ids,
+                    "prompt_embeds": prompt_embeds,
+                    "timesteps": timesteps,
+                    "mean_advantages": mean_advantages[:, :-1],
+                    "log_probs": log_probs,
+                    "rewards": rewards,
+                    "final_embedding": latents[:, -1],
+                    "image_embedding": embedded_images,
+                    "advantages": advantages,
+                    "clip_scores": clip_scores,
+                }
+            )
+
+        # wait for all rewards to be computed
+        for sample in tqdm(
+            samples,
+            desc="Waiting for rewards",
+            disable=not accelerator.is_local_main_process,
+            position=0,
+        ):
+            rewards, reward_metadata = sample["rewards"].result()
+            sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
+            # eval_results = sample["evals"].result()
+            eval_results = {key: torch.as_tensor(value, device=accelerator.device) for key, value in sample.items() if key not in ["prompt_ids", "prompt_embeds", "timesteps", "latents", "next_latents", "log_probs", "rewards", "advantages", "prompts"]}
+            sample.update(eval_results)
+            # del sample["evals"]
+
+        # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
+        prompts_list = [sample["prompts"] for sample in samples]
+        samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()if k not in ['tree', 'prompts']}
+        samples['prompts'] = prompts_list
+        # this is a hack to force wandb to log the images as JPEGs instead of PNGs
+        del image_embedder
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        save_dir = f'images/{config.run_name}'
+        search_dir = os.path.join(save_dir, f"search_{epoch+1}")
+        os.makedirs(save_dir, exist_ok=True) 
+        os.makedirs(search_dir, exist_ok=True) 
+        rank = accelerator.process_index  # 0, 1, ...
+        for i, (image, prompt) in enumerate(zip(images_list, prompts_history)):
+            filename = (
+                f"G{epoch+1}_rank{rank}_idx{i}"
+                f"_{prompt[:40].replace(os.sep,'_')}"          # (경로 구분자 무력화)
+                f"_{samples['rewards'][i]:.4f}.jpg"
+            )
+            pil_img = Image.fromarray((image[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+            pil_img.save(os.path.join(search_dir, filename))
+        
+        if dist.is_initialized():
+            accelerator.wait_for_everyone()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i, image in enumerate(images):
+                pil = Image.fromarray(
+                    (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                )
+                pil = pil.resize((256, 256))
+                pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+                
+            accelerator.log(
+                {
+                    "images": [
+                        wandb.Image(
+                            os.path.join(tmpdir, f"{i}.jpg"),
+                            caption=f"{prompt:.25} | {reward:.2f}",
+                        )
+                        for i, (prompt, reward) in enumerate(
+                            zip(prompts, rewards)
+                        )  # only log rewards from process 0
+                    ],
+                },
+                step=global_step,
+            )
+
+        # gather rewards across processes
+        rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
+        clip_scores = accelerator.gather(samples["clip_scores"]).cpu().numpy()        
+        
+        log_dict = {
+            "reward": rewards,
+            "reward_mean": rewards.mean(),
+            "reward_std": rewards.std(),
+            "clip_score": clip_scores,
+            "clip_score_mean": clip_scores.mean(),
+            "clip_score_std": clip_scores.std(),
+        }
+
+        accelerator.log(log_dict, step=global_step)
+
+
+
+if __name__ == "__main__":
+    app.run(main)

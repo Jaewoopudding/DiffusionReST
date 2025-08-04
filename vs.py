@@ -1,12 +1,29 @@
 import os
 import glob
+import argparse
+
 import pandas as pd
 import matplotlib.pyplot as plt
 
 # ------------------------------------------------------------------
 # 0. 설정
 # ------------------------------------------------------------------
-images_root = "/home/jaewoo/DiffusionReST/images"
+#
+# 기본 images_root 경로를 현 프로젝트의 `images_to_plot` 폴더로 두고,
+# 필요하면 CLI 인자로 덮어쓸 수 있도록 argparse를 사용한다.
+# 예) python vs.py --images_root /path/to/other/images
+parser = argparse.ArgumentParser(
+    description="각 experiment 의 all_metrics.csv 를 읽어서 다양한 지표를 플롯합니다."
+)
+parser.add_argument(
+    "--images_root",
+    type=str,
+    default="./images_to_plot",
+    help="실험 결과가 저장된 루트 디렉터리 (experiment 하위에 eval/all_metrics.csv 가 존재해야 함)"
+)
+args = parser.parse_args()
+
+images_root = args.images_root
 
 # 결과 폴더
 for d in [
@@ -44,7 +61,7 @@ for data_type in ['search_', 'eval_']:
     # 1-1) Aesthetic - vs - 각 지표
     # ────────────────────────────────────────────────────────────
     for y_metric in y_metrics:
-        plt.figure(figsize=(8, 6))
+        plt.figure(figsize=(10, 5))
         for csv_path in all_csv_paths:
             try:
                 df = pd.read_csv(csv_path)
@@ -86,7 +103,7 @@ for data_type in ['search_', 'eval_']:
     # 1-2) Epoch/Step - vs - 각 지표 (aesthetic 포함)
     # ────────────────────────────────────────────────────────────
     for y_metric in y_metrics + ["mean_aesthetic"]:
-        plt.figure(figsize=(8, 6))
+        plt.figure(figsize=(10, 5))
         for csv_path in all_csv_paths:
             try:
                 df = pd.read_csv(csv_path)

@@ -54,72 +54,6 @@ from typing import Optional, Callable, Dict, Any, List, DefaultDict
 import psutil
 
 
-def cycle(iterable):
-    while True:
-        for x in iterable:
-            yield x
-
-
-def print_memory_usage():
-    process = psutil.Process(os.getpid())
-    mem_info = process.memory_info()
-    rss = mem_info.rss / 1024**2  # Resident Set Size in MB
-    vms = mem_info.vms / 1024**2  # Virtual Memory Size in MB
-    print(f"[Memory] RSS: {rss:.2f} MB | VMS: {vms:.2f} MB")
-
-# import tracemalloc
-
-# tracemalloc.start()
-
-
-_CPU_PG = None          # lazy-init 한 번만
-
-def get_cpu_pg():
-    global _CPU_PG
-    if _CPU_PG is None:
-        # 기존 default(NCCL) 그룹은 건드리지 않고 새 그룹 생성
-        _CPU_PG = dist.new_group(backend="gloo")
-    return _CPU_PG
-
-
-def cpu_gather_object(obj):
-    if not dist.is_initialized():
-        return obj                     # single-process run
-
-    pg = get_cpu_pg()
-    world_size = dist.get_world_size(pg)
-    gathered = [None] * world_size
-    dist.all_gather_object(gathered, obj, group=pg)
-
-    flat = []
-    for g in gathered:
-        flat.extend(g if isinstance(g, list) else [g])
-    return flat
-
-
-
-def _split_dict_of_lists(d):
-    """
-    If d has values that are *all* list/tuple of equal length L,
-    turn it into a list[dict] of length L (one element per index).
-    Otherwise return [d] untouched.
-    """
-    list_keys = [k for k, v in d.items() if isinstance(v, (list, tuple))]
-    if not list_keys:
-        return [d]                      # nothing to split
-
-    L = len(d[list_keys[0]])
-    if not all(len(d[k]) == L for k in list_keys):
-        return [d]                      # inconsistent → leave as is
-
-    out = []
-    for i in range(L):
-        new_d = {}
-        for k, v in d.items():
-            new_d[k] = v[i] if isinstance(v, (list, tuple)) else v
-        out.append(new_d)
-    return out
-
 def collate_without_tree_prompt(batch):
     """
     batch : list[dict]  (각 dict 구조는
@@ -147,22 +81,6 @@ def collate_without_tree_prompt(batch):
     return out
     
 
-def _flatten_gathered(obj_list):
-    """
-    • unravel nested lists from gather_object  
-    • split dict-of-lists into list-of-dicts
-    """
-    flat = []
-    stack = list(obj_list)              # shallow copy
-    while stack:
-        itm = stack.pop()
-        if isinstance(itm, list):
-            stack.extend(itm)           # flatten one level
-        elif isinstance(itm, dict):
-            flat.extend(_split_dict_of_lists(itm))
-        else:
-            raise TypeError(f"Unexpected type from gather_object: {type(itm)}")
-    return flat
 
 
 class SearchDataset(torch.utils.data.Dataset):
@@ -835,7 +753,6 @@ def main(_):
     
     global_step = 0
     
-    
     for epoch in range(first_epoch, config.num_epochs):
         #################### SAMPLING ####################
         on_policy_dataset_per_gpu = []
@@ -882,7 +799,10 @@ def main(_):
 
             # sample
             with autocast():
-                shape = (config.search.duplicate * config.search.nfe_per_action, 4, 64, 64)
+                if config.initial_search:
+                    shape = (config.search.duplicate * config.search.nfe_per_action, 4, 64, 64)
+                else:
+                    shape = (config.search.nfe_per_action, 4, 64, 64)
                 init_latents = torch.randn(shape, device=accelerator.device)
                 pipeline.batch_size = 1
                 images, _, latents, log_probs, advantages, next_weighted_mean_states, mean_advantages, prior, _ = tree_pipeline_with_logprob(
@@ -910,7 +830,7 @@ def main(_):
             latents = torch.stack(
                 latents, dim=1
             )  # (batch_size, num_steps + 1, 4, 64, 64)
-            next_weighted_mean_states = torch.stack(next_weighted_mean_states_list[0], dim=1)
+            next_weighted_mean_states = torch.stack(next_weighted_mean_states, dim=1)
             log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
             mean_advantages = torch.stack(mean_advantages_list[0]).view(1, -1)
             timesteps = pipeline.scheduler.timesteps.repeat(
@@ -962,7 +882,6 @@ def main(_):
                     "clip_scores": clip_scores,
                 }
             )
-
         # wait for all rewards to be computed
         for sample in tqdm(
             samples,
@@ -1036,8 +955,7 @@ def main(_):
         rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
         clip_scores = accelerator.gather(samples["clip_scores"]).cpu().numpy()
         # metrics = {key: accelerator.gather(torch.stack([s[key] for s in samples])).cpu().numpy() for key in eval_results.keys()}
-        
-        
+
         log_dict = {
             "reward": rewards,
             "reward_mean": rewards.mean(),
@@ -1083,30 +1001,6 @@ def main(_):
                     (image[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
                 pil.save(os.path.join(save_dir, f"{epoch}_{(i + 1) * (accelerator.local_process_index + 1)}_eval_{eval_rewards[i]:.4f}.jpg"))
-                
-            # with tempfile.TemporaryDirectory() as tmpdir:
-            #     for i, image in enumerate(eval_images_list[0]):
-            #         pil = Image.fromarray(
-            #             (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-            #         )
-            #         pil = pil.resize((256, 256))
-            #         pil.save(os.path.join(tmpdir, f"{i}_eval.jpg"))
-                    
-            #     accelerator.log(
-            #         {
-            #             "eval_images": [
-            #                 wandb.Image(
-            #                     os.path.join(tmpdir, f"{i}_eval.jpg"),
-            #                     caption=f"{prompt:.25} | {eval_reward:.2f}",
-            #                 )
-            #                 for i, (prompt, eval_reward) in enumerate(
-            #                     zip(prompts, eval_rewards)
-            #                 )  # only log rewards from process 0
-            #             ],
-            #         },
-            #         step=global_step,
-            #     )
-
             # log rewards and images
             log_dict = {
                 "eval_reward": eval_rewards,
@@ -1481,7 +1375,7 @@ def main(_):
                                         eta=config.sample.eta,
                                         prev_sample=next_latents
                                     )
-                                loss = -advantages.clamp(max=5.) * search_log_prob
+                                loss = -(advantages.clamp(max=5.)) * search_log_prob
                                 info["positive_loss"].append(loss.detach())
                                 accelerator.backward(loss)
                                 if (config.train.kl_coef) == 0 and (not config.train.negative_gradient) and (accelerator.sync_gradients):
@@ -1587,89 +1481,88 @@ def main(_):
                                         )
                                     optimizer.step()
                                     optimizer.zero_grad()
-
-            eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(
-                pipeline=pipeline,
-                sample_neg_prompt_embeds=sample_neg_prompt_embeds,
-                config=config,
-                accelerator=accelerator,
-                epoch=epoch,
-                reward_fn=reward_fn,
-                executor=executor,
-                prompts_history=prompts_total,
-                prompts_metadata_history=prompt_metadata_total_for_eval,
-                prior_history=prior_total_for_eval,
-                autocast=autocast,
-                num_images_per_prompt=1 # config.eval.num_images_per_prompt // accelerator.num_processes,
-            )
-
-            eval_images_tensor = torch.cat(eval_images_list)
-            
-            eval_dir = os.path.join(save_dir, f"eval_{epoch+1}-improve_{improve_steps+1}")
-            os.makedirs(eval_dir, exist_ok=True)
-            rank = accelerator.process_index
-            for i, (image, prompt) in enumerate(zip(eval_images_tensor, prompts_total)):
-                filename = (
-                    f"G{epoch+1}_rank{rank}_idx{i}"
-                    f"_{prompt[:40].replace(os.sep,'_')}"
-                    f"_{eval_rewards[i]:.4f}.jpg"
+            if improve_steps == config.train.improve_steps - 1:
+                eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(
+                    pipeline=pipeline,
+                    sample_neg_prompt_embeds=sample_neg_prompt_embeds,
+                    config=config,
+                    accelerator=accelerator,
+                    epoch=epoch,
+                    reward_fn=reward_fn,
+                    executor=executor,
+                    prompts_history=prompts_total,
+                    prompts_metadata_history=prompt_metadata_total_for_eval,
+                    prior_history=prior_total_for_eval,
+                    autocast=autocast,
+                    num_images_per_prompt=1 # config.eval.num_images_per_prompt // accelerator.num_processes,
                 )
-                pil = Image.fromarray(
-                    (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-                )
-                pil.save(os.path.join(eval_dir, filename))
-            if dist.is_initialized():
-                accelerator.wait_for_everyone()
-    
-            with tempfile.TemporaryDirectory() as tmpdir:
-                eval_images = eval_images_list[0]  # 명확하게 지정
-                for i, image in enumerate(eval_images):
+
+                eval_images_tensor = torch.cat(eval_images_list)
+                
+                eval_dir = os.path.join(save_dir, f"eval_{epoch+1}-improve_{improve_steps+1}")
+                os.makedirs(eval_dir, exist_ok=True)
+                rank = accelerator.process_index
+                for i, (image, prompt) in enumerate(zip(eval_images_tensor, prompts_total)):
+                    filename = (
+                        f"G{epoch+1}_rank{rank}_idx{i}"
+                        f"_{prompt[:40].replace(os.sep,'_')}"
+                        f"_{eval_rewards[i]:.4f}.jpg"
+                    )
                     pil = Image.fromarray(
                         (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                     )
-                    pil = pil.resize((256, 256))
-                    pil.save(os.path.join(tmpdir, f"{i}_eval.jpg"))
-                
-                accelerator.log(
-                    {
-                        "eval_images": [
-                            wandb.Image(
-                                os.path.join(tmpdir, f"{i}_eval.jpg"),
-                                caption=f"{prompt:.25} | {eval_reward:.2f}",
-                            )
-                            for i, (prompt, eval_reward) in enumerate(
-                                zip(prompts[:len(eval_images_list[0])], eval_rewards[:len(eval_images_list[0])])
-                            )
-                        ],
-                    },
-                    step=global_step,
-                )
+                    pil.save(os.path.join(eval_dir, filename))
+                if dist.is_initialized():
+                    accelerator.wait_for_everyone()
+        
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    eval_images = eval_images_list[0]  # 명확하게 지정
+                    for i, image in enumerate(eval_images):
+                        pil = Image.fromarray(
+                            (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                        )
+                        pil = pil.resize((256, 256))
+                        pil.save(os.path.join(tmpdir, f"{i}_eval.jpg"))
+                    
+                    accelerator.log(
+                        {
+                            "eval_images": [
+                                wandb.Image(
+                                    os.path.join(tmpdir, f"{i}_eval.jpg"),
+                                    caption=f"{prompt:.25} | {eval_reward:.2f}",
+                                )
+                                for i, (prompt, eval_reward) in enumerate(
+                                    zip(prompts[:len(eval_images_list[0])], eval_rewards[:len(eval_images_list[0])])
+                                )
+                            ],
+                        },
+                        step=global_step,
+                    )
 
-            eval_rewards = accelerator.gather(eval_rewards).cpu().numpy()
-            # log rewards and images
-            log_dict = {
-                "eval_reward": eval_rewards,
-                "eval_reward_mean": eval_rewards.mean(),
-                "eval_reward_std": eval_rewards.std(),
-            }
-            
-            if config.reward_fn == "aesthetic_score_diff_clipped":
+                eval_rewards = accelerator.gather(eval_rewards).cpu().numpy()
+                # log rewards and images
                 log_dict = {
-                    "eval_reward": eval_rewards + 8.5,
-                    "eval_reward_mean": eval_rewards.mean() + 8.5,
+                    "eval_reward": eval_rewards,
+                    "eval_reward_mean": eval_rewards.mean(),
                     "eval_reward_std": eval_rewards.std(),
                 }
-            
-            accelerator.log(log_dict, step=global_step)
-
+                
+                if config.reward_fn == "aesthetic_score_diff_clipped":
+                    log_dict = {
+                        "eval_reward": eval_rewards + 8.5,
+                        "eval_reward_mean": eval_rewards.mean() + 8.5,
+                        "eval_reward_std": eval_rewards.std(),
+                    }
+                
+                accelerator.log(log_dict, step=global_step)
+                del eval_samples
+                del eval_images_list
+                del eval_rewards
+                del eval_images_tensor
 
             # make sure we did an optimization step at the end of the inner epoch
             assert accelerator.sync_gradients
             accelerator._dataloaders.clear()
-            del eval_samples
-            del eval_images_list
-            del eval_rewards
-            del eval_images_tensor
             gc.collect()
             torch.cuda.empty_cache()
 

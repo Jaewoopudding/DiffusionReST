@@ -46,7 +46,6 @@ class ImageRewardScorer(nn.Module):
         self.eval()
 
     def __call__(self, images, prompts):
-        breakpoint()
         images = (images * 255).round().clamp(0, 255)
         inputs = self.processor(images=images, return_tensors="pt")
         inputs = {k: v.to(self.dtype).to(self.device) for k, v in inputs.items()}["pixel_values"]

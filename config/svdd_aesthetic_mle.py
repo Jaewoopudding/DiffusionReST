@@ -31,6 +31,7 @@ def get_config():
     # about 10GB of GPU memory. beware that if LoRA is disabled, training will take a lot of memory and saved checkpoint
     # files will also be large.
     config.use_lora = True
+    config.initial_search = False
 
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()

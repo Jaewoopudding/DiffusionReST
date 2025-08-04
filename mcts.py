@@ -219,7 +219,6 @@ class TreePolicy:
         self.lookforward_fn = lambda r: r / self.kl_lagrangian_coef
         self.reward_fn = reward_fn
         # initial_children: torch.Tensor of shape (B * duplicate, C, H, W)
-        node_list = [Node(state=None, timestep=None, parent=None, reward=None)]
         self.device = pipeline.device
         self.pipeline_config = config
         if self.pipeline_config.train.kl_lagrangian_coef != 0 :
@@ -236,11 +235,15 @@ class TreePolicy:
         self.base_unet = pipeline.unet if config.search.hill_climbing else ref_unet
         
         # initial node for x_T starting point
-        self.root_nodes = BatchedNode(node_list)
+        self.root_nodes = BatchedNode([Node(state=None, timestep=None, parent=None, reward=None)])
         self.initial_nodes = self.root_nodes
+        if config.initial_search:
+            initial_duplicates = config.search.duplicate
+        else:
+            initial_duplicates = 1
         self.root_nodes.add_children(
-            initial_children.view(1, config.search.duplicate * config.search.nfe_per_action, *initial_children.shape[1:]), 
-            torch.ones(1, config.search.duplicate * config.search.nfe_per_action, device=self.device) * pipeline.scheduler.timesteps[0]
+            initial_children.view(1, initial_duplicates * config.search.nfe_per_action, *initial_children.shape[1:]), 
+            torch.ones(1, initial_duplicates * config.search.nfe_per_action, device=self.device) * pipeline.scheduler.timesteps[0]
         )
         
         for nodes in tqdm(list(zip(*self.root_nodes.get_novel_children())), desc='Initial Evaluating', leave=False, position=2, disable=True):
@@ -442,8 +445,6 @@ class TreePolicy:
                             states
         )
         
-        # if timesteps == 1:
-        #     breakpoint()
         image = self.pipeline.vae.decode(pred_original_sample.to(self.pipeline.vae.dtype) / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
         do_denormalize = [True] * image.shape[0]
         image = self.pipeline.image_processor.postprocess(image, output_type="pt", do_denormalize=do_denormalize)
@@ -452,6 +453,9 @@ class TreePolicy:
 
         step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
         discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - timesteps) // step_offset - 1)
+        
+        if isinstance(evaluation, np.ndarray):
+            evaluation = torch.tensor(evaluation, device=self.device)
         value_estimation = torch.nan_to_num(evaluation) / self.kl_lagrangian_coef * discount
         batched_nodes.value_estimation = value_estimation
         return evaluation
@@ -495,6 +499,7 @@ class TreePolicy:
         normalized_child_advantages = child_advantages / child_advantages.sum(dim=0)
         nodes.next_weighted_mean_states = (child_states * normalized_child_advantages.view(-1, 1, 1, 1)).sum(dim=0, keepdim=True)
         nodes.mean_advantages = child_advantages.mean(dim=0).view(1, -1)
+
 
     def act_and_prune(self, select_fn, prune=True):
         selected_nodes = []
@@ -540,6 +545,7 @@ class TreePolicy:
 
         log_w = torch.nan_to_num(child_rewards) / self.kl_lagrangian_coef * discount + child_ref_log_likelihood - child_log_likelihood
         log_w = log_w - torch.max(log_w, dim=0, keepdims=True)[0]
+        log_w = log_w.view(-1)
         return torch.distributions.Categorical(logits=log_w).sample()
 
     @torch.no_grad()

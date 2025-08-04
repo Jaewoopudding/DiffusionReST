@@ -65,6 +65,7 @@ def main(_):
         f'_M={config.search.duplicate}'
         f'_KL={config.train.kl_coef}'
         f'_G={config.search.value_gradient}:{config.search.kl_lagrangian_coef}'
+        f'_I={config.train.improve_steps}'
         f'_{datetime.datetime.now().strftime("%Y.%m.%d")}'
         f'_{config.run_name}'
     )
@@ -134,7 +135,7 @@ def main(_):
     
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="ddpo-pytorch",
+            project_name=config.reward_fn,
             config=config.to_dict(),
             init_kwargs={
                 "wandb": 
@@ -247,16 +248,9 @@ def main(_):
                 AttnProcsLayers(tmp_unet.attn_processors).state_dict()
             )
             del tmp_unet
-        elif not config.use_lora and isinstance(models[0], UNet2DConditionModel):
-            load_model = UNet2DConditionModel.from_pretrained(
-                input_dir, subfolder="unet"
-            )
-            models[0].register_to_config(**load_model.config)
-            models[0].load_state_dict(load_model.state_dict())
-            del load_model
         else:
             raise ValueError(f"Unknown model type {type(models[0])}")
-        models.pop()  # ensures that accelerate doesn't try to handle loading of the model
+        models.clear()  # ensures that accelerate doesn't try to handle loading of the model
 
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
@@ -328,11 +322,7 @@ def main(_):
     ) 
     
     # Prepare everything with our `accelerator`.
-    unet, optimizer = accelerator.prepare(unet, optimizer)
-    
-    # unet_pretrained는 inference만 하므로 prepare하지 않고 dtype만 변환
-    unet_pretrained = accelerator.prepare(unet_pretrained)
-
+    unet, optimizer, unet_pretrained = accelerator.prepare(unet, optimizer, unet_pretrained)
         
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
@@ -520,7 +510,6 @@ def main(_):
             # del sample["evals"]
 
 
-        print('finished reward update')
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         prompts_list = [sample["prompts"] for sample in samples]
         samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()if k not in ['tree', 'prompts']}
@@ -529,7 +518,6 @@ def main(_):
         del image_embedder
         gc.collect()
         torch.cuda.empty_cache()
-        print('del embedder')
         
         save_dir = f'images/{config.run_name}'
         search_dir = os.path.join(save_dir, f"search_{epoch+1}")
@@ -575,9 +563,7 @@ def main(_):
                 },
                 step=global_step,
             )
-        print('save images')
         # gather rewards across processes
-        print("rank:", accelerator.process_index, "rewards:", samples["rewards"].shape)
         rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
         clip_scores = accelerator.gather(samples["clip_scores"]).cpu().numpy()
         # metrics = {key: accelerator.gather(torch.stack([s[key] for s in samples])).cpu().numpy() for key in eval_results.keys()}
@@ -602,8 +588,6 @@ def main(_):
             }
 
         accelerator.log(log_dict, step=global_step)
-
-        print("generate eval    samples")
 
         eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(
             pipeline=pipeline,

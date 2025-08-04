@@ -68,6 +68,7 @@ def main(_):
         f'_I={config.train.improve_steps}'
         f'_{datetime.datetime.now().strftime("%Y.%m.%d")}'
         f'_{config.run_name}'
+        f'_S={config.seed}'
     )
     
     if os.path.exists(os.path.join(config.logdir, config.run_name)):

@@ -953,7 +953,7 @@ def main(_):
                 elif config.train.type == 'boltzmann_loss_fn': 
                     raise NotImplementedError
 
-            if improve_steps == config.train.improve_steps - 1:
+            if (improve_steps == config.train.improve_steps - 1) and (epoch % 5 == 0):
                 eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(
                     pipeline=pipeline,
                     sample_neg_prompt_embeds=sample_neg_prompt_embeds,

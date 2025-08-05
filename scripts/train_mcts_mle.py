@@ -320,7 +320,7 @@ def main(_):
         config.pretrained.model,
         revision=config.pretrained.revision,
         subfolder="unet",
-    ) 
+    ).to(accelerator.device, dtype=inference_dtype)
     
     # Prepare everything with our `accelerator`.
     unet, optimizer, unet_pretrained = accelerator.prepare(unet, optimizer, unet_pretrained)

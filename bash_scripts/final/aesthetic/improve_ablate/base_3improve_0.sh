@@ -1,12 +1,12 @@
 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config config/svdd_aesthetic_mle.py \
---config.run_name 2_improve \
+--config.run_name 3_improve \
 --config.reward_fn aesthetic_score_diff \
 --config.prompt_fn simple_animals \
 --config.train.type 'energy_based_negative_gradient' \
 --config.train.learning_rate 3e-4 \
 --config.sample.num_steps 50 \
---config.num_epochs 120 \
+--config.num_epochs 100 \
 --config.save_freq 2 \
 --config.multistep_mdp \
 --config.seed 0 \
@@ -18,6 +18,6 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.search.gamma 0.90 \
 --config.search.importance_sampling \
 --config.search.hill_climbing \
---config.train.improve_steps 2 \
+--config.train.improve_steps 3 \
 --noconfig.train.negative_gradient \
---config.train.kl_coef 0.005 \
+--config.train.kl_coef 0.01 \

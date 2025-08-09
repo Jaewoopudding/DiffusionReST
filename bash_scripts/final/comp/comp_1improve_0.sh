@@ -6,7 +6,8 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.train.type 'energy_based_negative_gradient' \
 --config.train.learning_rate 3e-4 \
 --config.sample.num_steps 50 \
---config.num_epochs 30 \
+--config.num_epochs 10 \
+--config.eval.eval_freq 1 \
 --config.save_freq 2 \
 --config.multistep_mdp \
 --config.seed 0 \

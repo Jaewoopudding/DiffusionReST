@@ -367,7 +367,7 @@ def main(_):
     
     global_step = 0
     
-    for epoch in range(first_epoch, config.num_epochs):
+    for epoch in range(first_epoch, config.num_epochs + 1):
         #################### SAMPLING ####################
         on_policy_dataset_per_gpu = []
         buffers = [PrioritizedReplayBuffer(capacity=10000, priority="rewards") for _ in range(num_prompts)]
@@ -953,7 +953,7 @@ def main(_):
                 elif config.train.type == 'boltzmann_loss_fn': 
                     raise NotImplementedError
 
-            if (improve_steps == config.train.improve_steps - 1) and (epoch % 5 == 0):
+            if (improve_steps == config.train.improve_steps - 1) and ((epoch + 1) % 5 == 0):
                 eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(
                     pipeline=pipeline,
                     sample_neg_prompt_embeds=sample_neg_prompt_embeds,
@@ -966,7 +966,7 @@ def main(_):
                     prompts_metadata_history=prompt_metadata_total_for_eval,
                     prior_history=prior_total_for_eval,
                     autocast=autocast,
-                    num_images_per_prompt=1 # config.eval.num_images_per_prompt // accelerator.num_processes,
+                    num_images_per_prompt=1 if (epoch != config.num_epochs - 1) and (epoch != 100) else 4
                 )
 
                 eval_images_tensor = torch.cat(eval_images_list)

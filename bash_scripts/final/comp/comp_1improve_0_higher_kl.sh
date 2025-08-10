@@ -1,7 +1,7 @@
 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config config/svdd_aesthetic_mle.py \
---config.run_name incomp_1improve_0_0.05 \
---config.reward_fn jpeg_incompressibility \
+--config.run_name comp_1improve_0_higher_kl \
+--config.reward_fn jpeg_compressibility \
 --config.prompt_fn simple_animals \
 --config.train.type 'energy_based_negative_gradient' \
 --config.train.learning_rate 3e-4 \
@@ -21,4 +21,4 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.search.hill_climbing \
 --config.train.improve_steps 1 \
 --noconfig.train.negative_gradient \
---config.train.kl_coef 0.01 \
+--config.train.kl_coef 0.02 \

@@ -19,6 +19,6 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.search.gamma 0.90 \
 --config.search.importance_sampling \
 --config.search.hill_climbing \
---config.train.improve_steps 1 \
+--config.train.improve_steps 4 \
 --noconfig.train.negative_gradient \
 --config.train.kl_coef 0.01 \

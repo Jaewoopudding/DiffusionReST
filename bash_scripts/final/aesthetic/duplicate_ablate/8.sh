@@ -4,7 +4,7 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.reward_fn aesthetic_score_diff \
 --config.prompt_fn simple_animals \
 --config.train.type 'energy_based_negative_gradient' \
---config.train.learning_rate 3e-4 \
+--config.train.learning_rate 1e-3 \
 --config.sample.num_steps 50 \
 --config.num_epochs 100 \
 --config.save_freq 5 \
@@ -20,4 +20,4 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.search.hill_climbing \
 --config.train.improve_steps 1 \
 --noconfig.train.negative_gradient \
---config.train.kl_coef 0.005 \
+--config.train.kl_coef 0.01 \

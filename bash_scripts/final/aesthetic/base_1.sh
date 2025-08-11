@@ -1,6 +1,6 @@
 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config config/svdd_aesthetic_mle.py \
---config.run_name base_0 \
+--config.run_name base_1 \
 --config.reward_fn aesthetic_score_diff \
 --config.prompt_fn simple_animals \
 --config.train.type 'energy_based_negative_gradient' \
@@ -9,7 +9,7 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.num_epochs 100 \
 --config.save_freq 5 \
 --config.multistep_mdp \
---config.seed 0 \
+--config.seed 1 \
 --config.sample.num_prompts_per_batch 8 \
 --config.sample.num_batches_per_epoch 8 \
 --config.search.value_gradient \

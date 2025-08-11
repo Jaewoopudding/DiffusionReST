@@ -1,6 +1,6 @@
 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config config/svdd_aesthetic_mle.py \
---config.run_name base_0 \
+--config.run_name duplicate_ablate_32 \
 --config.reward_fn aesthetic_score_diff \
 --config.prompt_fn simple_animals \
 --config.train.type 'energy_based_negative_gradient' \
@@ -14,7 +14,7 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.sample.num_batches_per_epoch 8 \
 --config.search.value_gradient \
 --config.search.kl_lagrangian_coef 0.005 \
---config.search.duplicate 4 \
+--config.search.duplicate 32 \
 --config.search.gamma 0.90 \
 --config.search.importance_sampling \
 --config.search.hill_climbing \

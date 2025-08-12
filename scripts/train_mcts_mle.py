@@ -966,7 +966,7 @@ def main(_):
                     prompts_metadata_history=prompt_metadata_total_for_eval,
                     prior_history=prior_total_for_eval,
                     autocast=autocast,
-                    num_images_per_prompt=1 if (epoch != config.num_epochs - 1) and (epoch != 100) else 4
+                    num_images_per_prompt=1 if ((epoch != config.num_epochs - 1) and (epoch + 1 != 100)) else 4
                 )
 
                 eval_images_tensor = torch.cat(eval_images_list)

@@ -116,6 +116,10 @@ class BatchedNode:
     @property
     def log_probs(self):
         return torch.stack([node.log_prob for node in self.node_list], dim=0)
+
+    @property
+    def ref_log_probs(self):
+        return torch.stack([node.ref_log_prob for node in self.node_list], dim=0)
     
     @property
     def value_estimation(self):
@@ -133,6 +137,12 @@ class BatchedNode:
         assert new_log_probs.shape[0] == self.batch_size, "Batch size mismatch in log_probs setter."
         for i, node in enumerate(self.node_list):
             node.log_prob = new_log_probs[i : i + 1]   
+
+    @ref_log_probs.setter
+    def ref_log_probs(self, new_ref_log_probs):
+        assert new_ref_log_probs.shape[0] == self.batch_size, "Batch size mismatch in ref_log_probs setter."
+        for i, node in enumerate(self.node_list):
+            node.ref_log_prob = new_ref_log_probs[i : i + 1]
 
     @property
     def next_weighted_mean_states(self):

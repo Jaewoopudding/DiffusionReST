@@ -452,6 +452,7 @@ def tree_pipeline_with_logprob(
     all_value_estimations = [] 
     all_next_weighted_mean_states = []
     all_mean_advantages = []
+    all_kl_divs = []
     
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
     
@@ -468,7 +469,8 @@ def tree_pipeline_with_logprob(
             all_value_estimations.append(tree.root_nodes.value_estimation)
             if i > 0:
                 all_log_probs.append(tree.root_nodes.log_probs)
-        
+                all_kl_divs.append(tree.root_nodes.log_probs - tree.root_nodes.ref_log_probs)
+
             if i == len(timesteps) - 1 or (
                 (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
             ):
@@ -476,7 +478,6 @@ def tree_pipeline_with_logprob(
                 if callback is not None and i % callback_steps == 0:
                     callback(i, t, latents)
                     
-
     if not output_type == "latent":
         latents = latents.to(self.unet.dtype)
         image = self.vae.decode(
@@ -505,4 +506,4 @@ def tree_pipeline_with_logprob(
     values = torch.cat(all_value_estimations).squeeze(-1) * config.search.kl_lagrangian_coef
     advantages = config.search.gamma * values[1:] - values[:-1]
 
-    return image, has_nsfw_concept, all_latents, all_log_probs, advantages, all_next_weighted_mean_states, all_mean_advantages, prior, tree
+    return image, has_nsfw_concept, all_latents, all_log_probs, advantages, all_next_weighted_mean_states, all_mean_advantages, all_kl_divs, prior, tree

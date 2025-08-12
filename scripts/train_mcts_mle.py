@@ -376,7 +376,7 @@ def main(_):
         eval_samples = []
         prompts = []
         images_list = []
-        advantages_list = []
+        kl_div_list = []
         next_weighted_mean_states_list = []
         eval_images_list = []
         num_images_per_prompt = config.sample.num_batches_per_epoch // config.sample.num_prompts_per_batch
@@ -419,7 +419,7 @@ def main(_):
                     shape = (config.search.nfe_per_action, 4, 64, 64)
                 init_latents = torch.randn(shape, device=accelerator.device)
                 pipeline.batch_size = 1
-                images, _, latents, log_probs, advantages, next_weighted_mean_states, mean_advantages, prior, _ = tree_pipeline_with_logprob(
+                images, _, latents, log_probs, advantages, next_weighted_mean_states, mean_advantages, kl_divs, prior, _ = tree_pipeline_with_logprob(
                     pipeline,
                     config=config,
                     reward_fn=reward_fn,
@@ -438,6 +438,7 @@ def main(_):
                 prior_history.append(prior)
                 prompts_history.append(prompt)
                 mean_advantages_list.append(mean_advantages)
+                kl_div_list.append(kl_divs)
                 prompts_metadata_history.append(prompt_metadata)
                 next_weighted_mean_states_list.append(next_weighted_mean_states)
 
@@ -446,7 +447,8 @@ def main(_):
             )  # (batch_size, num_steps + 1, 4, 64, 64)
             next_weighted_mean_states = torch.stack(next_weighted_mean_states, dim=1)
             log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
-            mean_advantages = torch.stack(mean_advantages_list[0]).view(1, -1)
+            mean_advantages = torch.stack(mean_advantages_list[-1]).view(1, -1)
+            traj_kl_divs = torch.stack(kl_div_list[-1]).sum().view(1, -1) # batchsize = n failure case
             timesteps = pipeline.scheduler.timesteps.repeat(
                 config.sample.batch_size, 1
             )  # (batch_size, num_steps)
@@ -494,6 +496,7 @@ def main(_):
                     "image_embedding": embedded_images,
                     "advantages": advantages,
                     "clip_scores": clip_scores,
+                    "traj_kl_divs": traj_kl_divs,
                 }
             )
         # wait for all rewards to be computed
@@ -567,6 +570,8 @@ def main(_):
         # gather rewards across processes
         rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
         clip_scores = accelerator.gather(samples["clip_scores"]).cpu().numpy()
+        traj_kl_divs = accelerator.gather(samples["traj_kl_divs"]).cpu().numpy()
+        elbo = rewards - traj_kl_divs
         # metrics = {key: accelerator.gather(torch.stack([s[key] for s in samples])).cpu().numpy() for key in eval_results.keys()}
 
         log_dict = {
@@ -576,6 +581,12 @@ def main(_):
             "clip_score": clip_scores,
             "clip_score_mean": clip_scores.mean(),
             "clip_score_std": clip_scores.std(),
+            "traj_kl_divs": traj_kl_divs,
+            "traj_kl_divs_mean": traj_kl_divs.mean(),
+            "traj_kl_divs_std": traj_kl_divs.std(),
+            "elbo": elbo,
+            "elbo_mean": elbo.mean(),
+            "elbo_std": elbo.std(),
         }
         
         if config.reward_fn == "aesthetic_score_diff_clipped":

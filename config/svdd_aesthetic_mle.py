@@ -105,7 +105,7 @@ def get_config():
     config.eval = eval = ml_collections.ConfigDict()
     eval.num_images_per_prompt = 8
     # frequency of evaluation (every N epochs)
-    eval.eval_freq = 5
+    eval.eval_freq = 10
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.

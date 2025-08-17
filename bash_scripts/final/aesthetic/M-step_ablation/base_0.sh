@@ -1,6 +1,6 @@
 accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config config/svdd_aesthetic_mle.py \
---config.run_name base_0 \
+--config.run_name m-ablation \
 --config.reward_fn aesthetic_score_diff \
 --config.prompt_fn simple_animals \
 --config.train.type 'energy_based_negative_gradient' \

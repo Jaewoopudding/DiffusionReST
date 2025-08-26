@@ -366,7 +366,7 @@ class TreePolicy:
                     evaluation = torch.nan_to_num(evaluation, nan=-1e6)
                 latent = latent.detach()
                 
-                discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - nodes.timesteps) // step_offset - 1)
+                discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - nodes.timesteps) // step_offset)
                 # min_scale = torch.tensor([min((1 + self.tempering_gamma) ** (((self.pipeline.scheduler.timesteps[0] - timesteps) // step_offset) + 1) - 1, 1.)] * timesteps.shape[0], device=self.device)
                 # min_scale_next = torch.tensor([min((1 + self.tempering_gamma) ** (((self.pipeline.scheduler.timesteps[0] - timesteps) // step_offset) + 2) - 1, 1.)] * timesteps.shape[0], device=self.device)
                 
@@ -462,7 +462,7 @@ class TreePolicy:
         batched_nodes.rewards = evaluation
 
         step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
-        discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - timesteps) // step_offset - 1)
+        discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - timesteps) // step_offset)
         
         if isinstance(evaluation, np.ndarray):
             evaluation = torch.tensor(evaluation, device=self.device)
@@ -551,7 +551,7 @@ class TreePolicy:
     @torch.no_grad()
     def importance_sampling(self, parent_visits_tensor, child_values, child_visits, child_rewards, child_log_likelihood, child_ref_log_likelihood, current_timesteps):
         step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
-        discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - current_timesteps) // step_offset - 1)
+        discount = self.gamma ** (self.pipeline.scheduler.num_inference_steps - (self.pipeline.scheduler.config.num_train_timesteps - current_timesteps) // step_offset)
 
         log_w = torch.nan_to_num(child_rewards) / self.kl_lagrangian_coef * discount + child_ref_log_likelihood - child_log_likelihood
         log_w = log_w - torch.max(log_w, dim=0, keepdims=True)[0]

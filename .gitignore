@@ -10,7 +10,9 @@
 *.pkl
 *.csv
 *.png
+!assets/*.png
 *.sh
+!bash_scripts/**/*.sh
 .idea/**/workspace.xml
 .idea/**/tasks.xml
 .idea/**/usage.statistics.xml

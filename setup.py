@@ -1,19 +1,8 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="ddpo-pytorch",
-    version="0.0.1",
-    packages=["ddpo_pytorch"],
-    python_requires=">=3.10",
-    install_requires=[
-        "ml-collections",
-        "absl-py",
-        "diffusers[torch]==0.17.1",
-        "accelerate==0.17",
-        "wandb",
-        "torchvision",
-        "inflect==6.0.4",
-        "pydantic==1.10.9",
-        "transformers==4.30.2",
-    ],
+    name="ddpo_pytorch",
+    version="0.1.0",
+    packages=find_packages(),
+    package_data={"ddpo_pytorch": ["assets/*.txt"]},
 )

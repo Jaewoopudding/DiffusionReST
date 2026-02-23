@@ -98,10 +98,6 @@ class AestheticScorerDiff(torch.nn.Module):
         embed = self.clip.get_image_features(pixel_values=inputs)
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
 
-
-        # device = next(self.parameters()).device
-        # embed = self.clip.get_image_features(pixel_values=images.to(self.dtype).to(device))
-        # embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         return self.mlp(embed).squeeze(1)
 
     

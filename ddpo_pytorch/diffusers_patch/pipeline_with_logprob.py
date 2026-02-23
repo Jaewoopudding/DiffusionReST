@@ -261,7 +261,7 @@ def pipeline_with_logprob(
 
 
 @torch.no_grad()
-def tree_pipeline_with_logprob(
+def search_pipeline_with_logprob(
     self: StableDiffusionPipeline,
     config,
     reward_fn,
@@ -429,13 +429,12 @@ def tree_pipeline_with_logprob(
 
     # 7. Denoising loop
     
-    from mcts import TreePolicy
-    tree = TreePolicy(
-        pipeline=self, 
-        initial_children = latents, 
-        do_classifier_free_guidance=do_classifier_free_guidance, 
-        select_function=None,
-        prompt_embeds=prompt_embeds, 
+    from search import SearchPolicy
+    tree = SearchPolicy(
+        pipeline=self,
+        initial_children=latents,
+        do_classifier_free_guidance=do_classifier_free_guidance,
+        prompt_embeds=prompt_embeds,
         cross_attention_kwargs=cross_attention_kwargs,
         guidance_scale=guidance_scale,
         eta=eta,
@@ -444,29 +443,22 @@ def tree_pipeline_with_logprob(
         prompt=prompts,
         prompt_metadata=prompt_metadata,
         ref_unet=ref_unet,
-        gamma=config.search.gamma
+        gamma=config.search.gamma,
     ) 
     prior = tree.select(tree.importance_sampling).states
     all_latents = []
     all_log_probs = []
-    all_value_estimations = [] 
-    all_next_weighted_mean_states = []
-    all_mean_advantages = []
     all_kl_divs = []
     
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
     
     with self.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(tqdm(timesteps, position=2, desc="Timesteps", leave=False, disable=True)):
-            for _ in tqdm(range(config.search.nfe_per_action), position=3, desc="NFE Budget", leave=False, disable=True):
-                current_nodes = tree.select(select_fn=tree.importance_sampling)
-                tree.expand(nodes=current_nodes, use_gradient=config.search.value_gradient, jump=False)    
+            current_nodes = tree.select(select_fn=tree.importance_sampling)
+            tree.expand(nodes=current_nodes, use_gradient=config.search.value_gradient)
             tree.act_and_prune(select_fn=tree.argmax_value, prune=False)  
             latents = tree.root_nodes.states
             all_latents.append(latents)
-            all_next_weighted_mean_states.append(current_nodes.next_weighted_mean_states[0])
-            all_mean_advantages.append(current_nodes.mean_advantages)
-            all_value_estimations.append(tree.root_nodes.value_estimation)
             if i > 0:
                 all_log_probs.append(tree.root_nodes.log_probs)
                 all_kl_divs.append(tree.root_nodes.log_probs - tree.root_nodes.ref_log_probs)
@@ -503,7 +495,4 @@ def tree_pipeline_with_logprob(
     if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
         self.final_offload_hook.offload()
 
-    values = torch.cat(all_value_estimations).squeeze(-1) * config.search.kl_lagrangian_coef
-    advantages = config.search.gamma * values[1:] - values[:-1]
-
-    return image, has_nsfw_concept, all_latents, all_log_probs, advantages, all_next_weighted_mean_states, all_mean_advantages, all_kl_divs, prior, tree
+    return image, has_nsfw_concept, all_latents, all_log_probs, all_kl_divs, prior, tree

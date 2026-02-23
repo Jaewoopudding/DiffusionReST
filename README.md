@@ -77,3 +77,8 @@ All hyperparameters have defaults in `config/dav.py` and can be overridden via c
 | `save_freq` | Checkpoint saving frequency (epochs). |
 | `eval.eval_freq` | Evaluation frequency (epochs). |
 | `initial_search` | If True, initial latent shape is scaled by `duplicate`. |
+
+
+## Acknowledgement
+
+This codebase builds upon the [DDPO-pytorch](https://github.com/kvablack/ddpo-pytorch) implementation. We thank the authors for making their code publicly available.

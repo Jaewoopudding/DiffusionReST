@@ -1,6 +1,6 @@
 # Diffusion Alignment as Variational Expectation-Maximization (Text-to-Image Generation)
 
-This repository is official codebase of Diffusion Alignment as Variational Expectation-Maximization (DAV) for Text-to-Image generation. This implementation optimizes Stable Diffusion v1.5 based on aesthetic score, compressibility, and incompressibility rewards. If you are interested in applying DAV to DNA sequence optimization, please refer to [here].
+This repository is the official codebase of [Diffusion Alignment as Variational Expectation-Maximization (DAV)](https://arxiv.org/abs/2510.00502) for Text-to-Image generation. This implementation optimizes Stable Diffusion v1.5 based on aesthetic score, compressibility, and incompressibility rewards. If you are interested in applying DAV to DNA sequence optimization, please refer to [here](https://your-link-here.com).
 
 <p align="center">
   <img src="assets/t2i_comparison.png" width="100%">

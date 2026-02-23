@@ -1,0 +1,20 @@
+accelerate launch --main_process_port 29501 scripts/dav.py \
+--config config/dav.py \
+--config.run_name base_0 \
+--config.reward_fn aesthetic_score_diff \
+--config.prompt_fn simple_animals \
+--config.train.learning_rate 1e-3 \
+--config.sample.num_steps 50 \
+--config.num_epochs 100 \
+--config.save_freq 5 \
+--config.seed 0 \
+--config.sample.num_prompts_per_batch 8 \
+--config.sample.num_batches_per_epoch 8 \
+--config.search.value_gradient \
+--config.search.search_kl 0.005 \
+--config.search.duplicate 4 \
+--config.search.gamma 0.90 \
+--config.search.importance_sampling \
+--config.search.hill_climbing \
+--config.train.improve_steps 1 \
+--config.train.train_kl 0.01 \

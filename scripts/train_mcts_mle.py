@@ -360,7 +360,7 @@ def main(_):
     if config.resume_from:
         logger.info(f"Resuming from {config.resume_from}")
         accelerator.load_state(config.resume_from)
-        first_epoch = int(config.resume_from.split("_")[-1]) + 1
+        first_epoch = int(config.resume_from.split("_")[-1]) * 5 + 1
     else:
         first_epoch = 0
 

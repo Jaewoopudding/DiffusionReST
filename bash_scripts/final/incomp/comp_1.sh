@@ -11,8 +11,8 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.save_freq 1 \
 --config.multistep_mdp \
 --config.seed 2 \
---config.sample.num_prompts_per_batch 16 \
---config.sample.num_batches_per_epoch 16 \
+--config.sample.num_prompts_per_batch 8 \
+--config.sample.num_batches_per_epoch 8 \
 --noconfig.search.value_gradient \
 --config.search.kl_lagrangian_coef 0.005 \
 --config.search.duplicate 16 \

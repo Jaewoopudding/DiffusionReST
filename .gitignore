@@ -19,7 +19,7 @@
 *.pt
 # AWS User-specific
 .idea/**/aws.xml
-
+models/*
 # Generated files
 .idea/**/contentModel.xml
 

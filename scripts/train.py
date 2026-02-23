@@ -637,8 +637,8 @@ def main(_):
                             config.train.adv_clip_max,
                         )
                         ratio = torch.exp(log_prob - sample["log_probs"][:, j])
-                        unclipped_loss = -advantages * ratio
-                        clipped_loss = -advantages * torch.clamp(
+                        unclipped_loss = -torch.exp(advantages) * ratio
+                        clipped_loss = -torch.exp(advantages) * torch.clamp(
                             ratio,
                             1.0 - config.train.clip_range,
                             1.0 + config.train.clip_range,
@@ -690,7 +690,7 @@ def main(_):
         if epoch != 0 and epoch % config.save_freq == 0 and accelerator.is_main_process:
             accelerator.save_state()
             
-        if epoch % 10 == 0:
+        if epoch % 5 == 0:
             from ddpo_pytorch.prompts import simple_animals
             prompts_total, prompt_metadata = simple_animals(**config.prompt_fn_kwargs)
             eval_samples, eval_images_list, eval_rewards = generate_evaluation_samples(

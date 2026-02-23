@@ -20,4 +20,4 @@ accelerate launch --main_process_port 29501 scripts/train_mcts_mle.py \
 --config.search.hill_climbing \
 --config.train.improve_steps 1 \
 --noconfig.train.negative_gradient \
---config.train.kl_coef 0.01 \
+--config.train.kl_coef 0.00 \

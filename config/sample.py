@@ -13,11 +13,11 @@ def get_config():
     config.logdir = "logs"
     # number of epochs to train for. each epoch is one round of sampling from the model followed by training on those
     # samples.
-    config.num_epochs = 200
+    config.num_epochs = 5
     # number of epochs between saving model checkpoints.
-    config.save_freq = 20
+    config.save_freq = 5
     # number of checkpoints to keep before overwriting old ones.
-    config.num_checkpoint_limit = 5
+    config.num_checkpoint_limit = 50
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
     config.mixed_precision = "fp16"
     # allow tf32 on Ampere GPUs, which can speed up training.
@@ -31,6 +31,9 @@ def get_config():
     # about 10GB of GPU memory. beware that if LoRA is disabled, training will take a lot of memory and saved checkpoint
     # files will also be large.
     config.use_lora = True
+    config.initial_search = False
+    config.search_or_zeroshot = False
+    config.checkpoint_interval = 1
 
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
@@ -39,10 +42,12 @@ def get_config():
     # revision of the model to load.
     pretrained.revision = "main"
 
+    config.checkpoint_dir = ""
     ###### Sampling ######
     config.sample = sample = ml_collections.ConfigDict()
     # number of sampler inference steps.
-    sample.num_steps = 50
+    sample.num_steps = 5
+    sample.count = 4
     # eta parameter for the DDIM sampler. this controls the amount of noise injected into the sampling process, with 0.0
     # being fully deterministic and 1.0 being equivalent to the DDPM sampler.
     sample.eta = 1.0
@@ -52,7 +57,8 @@ def get_config():
     sample.batch_size = 1
     # number of batches to sample per epoch. the total number of samples per epoch is `num_batches_per_epoch *
     # batch_size * num_gpus`.
-    sample.num_batches_per_epoch = 2
+    sample.num_batches_per_epoch = 4
+    sample.num_prompts_per_batch = 4 # for prompt-conditional buffer
 
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
@@ -61,7 +67,7 @@ def get_config():
     # whether to use the 8bit Adam optimizer from bitsandbytes.
     train.use_8bit_adam = False
     # learning rate.
-    train.learning_rate = 3e-4
+    train.learning_rate = 1e-5
     # Adam beta1.
     train.adam_beta1 = 0.9
     # Adam beta2.
@@ -70,14 +76,11 @@ def get_config():
     train.adam_weight_decay = 1e-4
     # Adam epsilon.
     train.adam_epsilon = 1e-8
-    # number of gradient accumulation steps. the effective batch size is `batch_size * num_gpus *
-    # gradient_accumulation_steps`.
-    train.gradient_accumulation_steps = 32
     # maximum gradient norm for gradient clipping.
     train.max_grad_norm = 1.0
     # number of inner epochs per outer epoch. each inner epoch is one iteration through the data collected during one
     # outer epoch's round of sampling.
-    train.num_inner_epochs = 1
+    train.improve_steps = 1
     # whether or not to use classifier-free guidance during training. if enabled, the same guidance scale used during
     # sampling will be used during training.
     train.cfg = True
@@ -88,16 +91,37 @@ def get_config():
     # the fraction of timesteps to train on. if set to less than 1.0, the model will be trained on a subset of the
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
     train.timestep_fraction = 1.0
+    
+    
+    # number of gradient steps to take per improve step
+    train.gradient_steps_per_improve_step = 1000
+    # number of total batch size used at improve step
+    train.total_batch_size = 256
+    # kl regularizer coefficient
+    train.kl_coef = 0.00
+    # DPO or SFT?
+    train.type = 'sft' # dpo or sft
+    train.beta_dpo = 5000
+    train.negative_gradient = True
+    train.accumulation_multipler = 1
+    train.kl_lagrangian_coef = 0.
+    
+    config.eval = eval = ml_collections.ConfigDict()
+    eval.num_images_per_prompt = 8
+    # frequency of evaluation (every N epochs)
+    eval.eval_freq = 10
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
-    config.prompt_fn = "simple_animals_ddpo"
+    # config.prompt_fn = "imagenet_animals"
+    config.prompt_fn = "simple_animals" # for prompt-conditional buffer
     # kwargs to pass to the prompt function.
     config.prompt_fn_kwargs = {}
 
-    ###### Reward Function ######
     # reward function to use. see `rewards.py` for available reward functions.
-    config.reward_fn = "aesthetic_score"
+    config.reward_fn = "aesthetic_score" # aesthetic_score jpeg_compressibility
+    config.eval_fn = "multi_reward_evaluation"
+    config.multistep_mdp = True
 
     ###### Per-Prompt Stat Tracking ######
     # when enabled, the model will track the mean and std of reward on a per-prompt basis and use that to compute
@@ -109,5 +133,30 @@ def get_config():
     # the minimum number of reward values to store in the buffer before using the per-prompt mean and std. if the buffer
     # contains fewer than `min_count` values, the mean and std of the entire batch will be used instead.
     config.per_prompt_stat_tracking.min_count = 16
+    
+    ###### Searching ######
+    config.search = search = ml_collections.ConfigDict()
+    
+    search.nfe_per_action = 1
+    search.duplicate = 10
+    search.expansion_coef = 0.0
+    search.progressive_widening = False
+    search.pw_alpha = 0.0
+    search.value_gradient = False
+    search.kl_lagrangian_coef = 0.005
+    search.tempering_gamma = 0.008
+    search.jump_policy = False
+    search.importance_sampling = True
+    search.gamma = 0.90
+    search.hill_climbing = True
 
+
+    config.buffer = buffer = ml_collections.ConfigDict()
+    
+    buffer.per_prompt_filtering_flag = True
+    buffer.per_prompt_select_flag = False
+    buffer.reward_filtering_criteria = 0.0
+    buffer.clip_score_filtering_criteria = 0.0
+    buffer.off_policy_subset_size = 0
+    
     return config
